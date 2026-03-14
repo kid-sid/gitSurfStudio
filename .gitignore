@@ -1,0 +1,38 @@
+# --- GitSurf Studio Monorepo GitIgnore ---
+
+# --- Python / Engine ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+engine/.cache/
+engine/.env
+engine/.gitsurf_history.json
+engine/faiss_index/
+engine/symbol_minimap.json
+
+# --- Node / Svelte Frontend ---
+app/node_modules/
+app/dist/
+app/.svelte-kit/
+.DS_Store
+*.log
+
+# --- Rust / Tauri ---
+app/src-tauri/target/
+app/src-tauri/bin/
+
+# --- Artifacts & Brain ---
+brain/
+implementation_plan*.md
+walkthrough.md
+task.md
+codebase_review.md
+
+# --- OS / IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db

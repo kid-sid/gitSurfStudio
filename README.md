@@ -1,0 +1,77 @@
+# 🌊 GitSurf Studio
+
+**The blazing-fast, lightweight AI-powered IDE for autonomous codebase evolution.**
+
+GitSurf Studio transforms the power of the GitSurf AI engine into a professional, native desktop experience. Built with a focus on speed, efficiency, and deep codebase reasoning, it allows you to explore any local folder or GitHub repository with a persistent AI assistant.
+
+---
+
+## ✨ Key Features
+
+- 🚀 **Zero Cold-Start AI**: Persistent FastAPI daemon keeps models and search indexes ready in RAM for instant responses.
+- 🤖 **Autonomous PRAR Engine**: A "Perceive-Reason-Act-Reflect" agent that doesn't just chat—it searches code, reads documentation, and applies patches directly.
+- 🐚 **Ultra-Lightweight Frontend**: Built with **Tauri** and **Svelte 5** (Runes) for a native feel with minimal memory footprint compared to Electron-based IDEs.
+- 🌍 **Universal Explorer**: Paste a GitHub URL or a local file path to start exploring even the most complex projects instantly.
+- 💻 **Monaco-Powered Editor**: High-performance code editing with syntax highlighting and a VS Code-inspired interface.
+
+---
+
+## 🏗️ Architecture
+
+GitSurf Studio follows a **Thin Client, Smart Backend** monorepo structure:
+
+```text
+gitSurfStudio/
+├── engine/              # Python AI Backend (FastAPI + PRAR Pipeline)
+│   ├── src/             # Core logic: orchestrator, llm_client, tools
+│   ├── .cache/          # Cloned GitHub repositories
+│   ├── server.py        # The AI daemon (REST + JSON Streaming)
+│   └── .env             # API Configuration (OpenAI, GitHub)
+│
+└── app/                 # Native Desktop Frontend
+    ├── src/             # Svelte 5 UI (App, FileTree, ChatPanel, Editor)
+    └── src-tauri/       # Rust native shell & Sidecar configuration
+```
+
+---
+
+## 🚀 Getting Started
+
+### 1. Prerequisites
+- **Python 3.10+** (for the AI Engine)
+- **Node.js 18+** (for the Frontend)
+- **Rust** (for Tauri native build)
+
+### 2. Configure the Engine
+Navigate to the `engine` directory and set up your environment:
+```powershell
+cd engine
+pip install -r requirements.txt
+# Create a .env file with your keys:
+# OPENAI_API_KEY=sk-...
+# GITHUB_TOKEN=github_pat_...
+```
+
+### 3. Launch GitSurf Studio
+In one terminal, start the AI Engine:
+```powershell
+cd engine
+uvicorn server:app --host 127.0.0.1 --port 8000
+```
+
+In another terminal, launch the Desktop App:
+```powershell
+cd app
+npm install
+npm run tauri dev
+```
+
+---
+
+## 🛠️ Technology Stack
+- **Frontend**: [Svelte 5](https://svelte.dev/) (Runes), [Tauri](https://tauri.app/), [Vite](https://vitejs.dev/)
+- **Backend**: [FastAPI](https://fastapi.tiangolo.com/), [Uvicorn](https://www.uvicorn.org/)
+- **AI Core**: [OpenAI GPT-4o](https://openai.com/), [Ripgrep](https://github.com/BurntSushi/ripgrep), [FAISS](https://github.com/facebookresearch/faiss)
+
+## 📄 License
+MIT License. Built with 🌊 by Sidhartha.

@@ -1,0 +1,42 @@
+[
+  {
+    "role": "user",
+    "content": "Is BERT creates index once in the first question only?"
+  },
+  {
+    "role": "assistant",
+    "content": "The BERT model used in the `CrossEncoderReranker` does not create an index. Instead, it scores each query-chunk pair in real-time whenever the `rerank` method is called. This means that the relevance scores are computed freshly for each new query and set of candidate chunks, rather than relying on any precomputed index. The only caching mechanism mentioned is the `_MODEL_CACHE` which is used to load the BERT model once per session to improve efficiency, but this is unrelated to indexing content."
+  },
+  {
+    "role": "user",
+    "content": "What is this project about>"
+  },
+  {
+    "role": "assistant",
+    "content": "The project is called the 'Agentic Search Tool', designed to perform context-aware, semantic code searches across large repositories using a modular pipeline architecture. It combines statistical models with LLM intelligence to provide efficient searches. The system processes user requests by refining queries, identifying relevant files, and retrieving information through various search methods before final processing and action execution."
+  },
+  {
+    "role": "user",
+    "content": "What is this project about?"
+  },
+  {
+    "role": "assistant",
+    "content": "The project is called 'gitSurf', an AI-powered Agentic CLI tool developed to perform context-aware semantic code search and autonomous file editing across both local and remote GitHub repositories. It treats code interaction as a reasoning problem, allowing it to navigate a codebase to find answers or execute commands. Key features include a Triple-Hybrid Search (combining semantic, keyword, and regex searches), Agentic Action Loop for reasoning about context, and tools that safely modify files based on the user's request. The tool is designed to overcome limitations of standard Retrieval Augmented Generation techniques in the context of code, focusing on conceptual understanding, keyword relevance, and exact pattern matching."
+  },
+  {
+    "role": "user",
+    "content": "What is this project about?"
+  },
+  {
+    "role": "assistant",
+    "content": "The project 'gitSurf' is an AI-powered Agentic CLI tool developed to perform context-aware semantic code search and autonomous file editing across both local and remote GitHub repositories. It treats code interaction as a reasoning problem, allowing it to navigate a codebase to find answers or execute commands. Key features include a Triple-Hybrid Search (combining semantic, keyword, and regex searches), an Agentic Action Loop for reasoning about context, and tools that safely modify files based on the user's request. The tool is designed to overcome limitations of standard Retrieval Augmented Generation techniques in the context of code, focusing on conceptual understanding, keyword relevance, and exact pattern matching."
+  },
+  {
+    "role": "user",
+    "content": "What is the orchestrator module responsible for?"
+  },
+  {
+    "role": "assistant",
+    "content": "The orchestrator module is responsible for coordinating pipelines and the shared ReAct (Reason + Act) action loop. It contains methods for running a code-aware pipeline for GitHub repository searches, a local file system search pipeline, and executing a shared ReAct loop used by both pipelines. This module integrates different tools and orchestrates the steps for processing user queries, retrieving relevant code data, and executing actions based on AI reasoning."
+  }
+]
