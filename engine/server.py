@@ -77,6 +77,10 @@ class AutocompleteRequest(BaseModel):
     file_path: str     # Current file being edited
     path: str          # Workspace root
 
+class WriteRequest(BaseModel):
+    path: str
+    content: str
+
 
 AVAILABLE_TOOLS = """
 Tool: FileEditorTool
@@ -194,6 +198,41 @@ async def read_file(path: str):
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return {"content": f.read()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/write")
+async def write_file(req: WriteRequest):
+    """Writes content to a file on local disk."""
+    abs_path = os.path.abspath(req.path)
+    
+    # Safety check: Ensure the path is within the workspace if one is active
+    if state.workspace_path:
+        if not abs_path.startswith(state.workspace_path):
+             raise HTTPException(status_code=403, detail="Path outside of workspace")
+    
+    try:
+        # Ensure directories exist
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        
+        # Use FileEditorTool if it exists to preserve its logic (e.g. rel_path handling)
+        if state.workspace_path and "FileEditorTool" in state.agent_tools:
+            editor = state.agent_tools["FileEditorTool"]
+            try:
+                rel_path = os.path.relpath(abs_path, state.workspace_path)
+                res = editor.write_file(rel_path, req.content)
+                if "[Error]" in res:
+                    raise Exception(res)
+                return {"status": "success", "message": res}
+            except ValueError:
+                # Path might be absolute but outside root or just tricky relpath
+                pass
+
+        # Fallback to direct write
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(req.content)
+        return {"status": "success", "message": f"Wrote to {abs_path}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

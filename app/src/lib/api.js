@@ -43,6 +43,24 @@ export async function readFile(path) {
 }
 
 /**
+ * Writes content to a file
+ * @param {string} path - Absolute path to the file
+ * @param {string} content - New file content
+ */
+export async function writeFile(path, content) {
+  const response = await fetch(`${ENGINE_URL}/write`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, content }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to write file");
+  }
+  return await response.json();
+}
+
+/**
  * Checks if the engine is online
  */
 export async function checkHealth() {

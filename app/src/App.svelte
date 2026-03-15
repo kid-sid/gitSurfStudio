@@ -7,7 +7,8 @@
   import StatusBar from "./components/StatusBar.svelte";
   import { initWorkspace, checkHealth } from "./lib/api.js";
 
-  let currentFile = $state("");
+  let activeFile = $state("");
+  let openFiles = $state([]);
   let workspacePath = $state("");
   let engineOnline = $state(false);
   let isInitializing = $state(false);
@@ -41,13 +42,19 @@
   }
 
   function handleFileSelect(event) {
-    currentFile = event.detail.path;
+    const path = event.detail.path;
+    if (!openFiles.includes(path)) {
+      openFiles = [...openFiles, path];
+    }
+    activeFile = path;
   }
 
   function handleWorkspaceOpen(event) {
     // User triggered an open from the file tree
     workspacePath = ""; // Go back to splash screen
     initInput = event.detail.path || "";
+    openFiles = [];
+    activeFile = "";
   }
 </script>
 
@@ -59,11 +66,11 @@
       <span class="title-bar__name">GitSurf Studio</span>
     </div>
     <div class="title-bar__center">
-      <span class="title-bar__file">{currentFile || workspacePath || "Welcome"}</span>
+      <span class="title-bar__file">{activeFile || workspacePath || "Welcome"}</span>
     </div>
     <div class="title-bar__right">
-      <span class="title-bar__status" class:online={engineOnline}>
-        {engineOnline ? "Engine Online" : "Engine Offline"}
+      <span class="status-bar__item status-bar__engine" class:online={engineOnline}>
+        ● {engineOnline ? "Engine Connected" : "Engine Disconnected"}
       </span>
     </div>
   </header>
@@ -106,7 +113,11 @@
       </aside>
 
       <main class="editor-area">
-        <CodeEditor filePath={currentFile} {workspacePath} />
+        <CodeEditor 
+          bind:activeFile={activeFile} 
+          bind:openFiles={openFiles} 
+          {workspacePath} 
+        />
       </main>
 
       <aside class="chat-panel">
@@ -115,7 +126,7 @@
     </div>
   {/if}
 
-  <StatusBar {currentFile} {engineOnline} {workspacePath} />
+  <StatusBar currentFile={activeFile} {engineOnline} {workspacePath} />
 </div>
 
 <style>
