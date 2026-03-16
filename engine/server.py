@@ -49,14 +49,16 @@ app.add_middleware(
 )
 
 class EngineState:
-    """Holds initialized components across requests (zero cold-start)."""
     def __init__(self):
         self.llm: Optional[LLMClient] = None
         self.history: Optional[HistoryManager] = None
         self.pipeline_ctx: Optional[PipelineContext] = None
         self.agent_tools: Dict = {}
         self.workspace_path: Optional[str] = None
-        self.repo_manager = RepoManager(cache_dir=os.path.join(os.path.dirname(__file__), ".cache"))
+        self.project_context: str = ""          # ← add this
+        self.repo_manager = RepoManager(
+            cache_dir=os.path.join(os.path.dirname(__file__), ".cache")
+        )
 
 state = EngineState()
 
@@ -88,8 +90,10 @@ Description: Read, write, modify, or delete files inside the project directory.
 Methods:
   - read_file(rel_path, start_line=None, end_line=None)
   - write_file(rel_path, content)
-  - replace_in_file(rel_path, target, replacement)
-  - delete_file(rel_path)
+  - replace_in_file(rel_path, target, replacement, allow_multiple=False)
+    NOTE: target must match exactly once unless allow_multiple=True.
+    On ambiguity, returns the line numbers of all matches to help refine the target.
+  - delete_file(rel_path)   
 
 Tool: SearchTool
 Description: Search for text patterns in the codebase using ripgrep.
@@ -106,15 +110,32 @@ Methods:
 
 
 def _ensure_initialized(workspace_path: str):
-    """Initialize or re-initialize engine components for the given workspace."""
     if state.workspace_path == workspace_path and state.llm is not None:
-        return  # Already initialized for this workspace
+        return
 
     state.workspace_path = workspace_path
     state.llm = LLMClient()
     state.history = HistoryManager(
         history_file=os.path.join(workspace_path, ".gitsurf_history.json")
     )
+
+    # ── Wire project context ──────────────────────────────────────────
+    # Check for README variants in priority order
+    readme_candidates = ["README.md", "readme.md", "README.rst", "README.txt"]
+    state.project_context = ""
+    for candidate in readme_candidates:
+        readme_path = os.path.join(workspace_path, candidate)
+        if os.path.exists(readme_path):
+            try:
+                with open(readme_path, "r", encoding="utf-8", errors="replace") as f:
+                    readme_content = f.read()
+                print(f"[Init] Analyzing project context from {candidate}...")
+                state.project_context = state.llm.analyze_project_context(readme_content)
+                print(f"[Init] Project context ready ({len(state.project_context)} chars)")
+            except Exception as e:
+                print(f"[Init] Warning: Could not analyze README: {e}")
+            break   # stop at first found
+    # ─────────────────────────────────────────────────────────────────
 
     file_editor = FileEditorTool(root_path=workspace_path)
     searcher = SearchTool()
@@ -139,26 +160,26 @@ async def health():
 
 @app.post("/init")
 async def init_workspace(req: InitRequest):
-    """
-    Initializes a workspace from a local path or GitHub URL.
-    """
     target_path = req.input.strip()
 
-    # Detect GitHub URL
     if "github.com" in target_path:
         repo_name = target_path.split("github.com/")[-1].strip("/")
         try:
             target_path = state.repo_manager.sync_repo(repo_name)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to clone repository: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to clone: {e}")
     else:
-        # Local path validation
         target_path = os.path.abspath(target_path)
         if not os.path.exists(target_path):
             raise HTTPException(status_code=404, detail="Local path does not exist")
 
     _ensure_initialized(target_path)
-    return {"status": "success", "workspace_path": target_path}
+
+    return {
+        "status": "success",
+        "workspace_path": target_path,
+        "has_project_context": bool(state.project_context),  # ← useful for frontend
+    }
 
 
 @app.get("/files")
@@ -239,14 +260,9 @@ async def write_file(req: WriteRequest):
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    """
-    Run the full PRAR pipeline for a user query.
-    Returns a streaming response with the agent's thought process and final answer.
-    """
     _ensure_initialized(req.path)
 
     async def stream_response():
-        # Capture stdout from the pipeline (step labels, thoughts, observations)
         captured = StringIO()
 
         def run_pipeline():
@@ -255,7 +271,7 @@ async def chat(req: ChatRequest):
                     question=req.query,
                     search_path=req.path,
                     llm=state.llm,
-                    project_context="",
+                    project_context=state.project_context,  # ← was ""
                     available_tools=AVAILABLE_TOOLS,
                     tools=state.agent_tools,
                     history=req.history,
@@ -263,26 +279,19 @@ async def chat(req: ChatRequest):
                 )
             return answer, context
 
-        # Run the blocking pipeline in a thread to keep FastAPI async
         loop = asyncio.get_event_loop()
         answer, context = await loop.run_in_executor(None, run_pipeline)
 
-        # Stream the captured pipeline logs first
         logs = captured.getvalue()
         if logs:
             yield json.dumps({"type": "log", "content": logs}) + "\n"
 
-        # Then stream the final answer
         yield json.dumps({"type": "answer", "content": answer}) + "\n"
 
-        # Save to history
         if state.history:
             state.history.add_interaction(req.query, answer)
 
-    return StreamingResponse(
-        stream_response(),
-        media_type="application/x-ndjson",
-    )
+    return StreamingResponse(stream_response(), media_type="application/x-ndjson")
 
 
 @app.post("/index")
@@ -301,10 +310,6 @@ async def reindex(req: IndexRequest):
 
 @app.post("/autocomplete")
 async def autocomplete(req: AutocompleteRequest):
-    """
-    Fast inline code completion. Skips the heavy PRAR pipeline
-    and hits the LLM directly with the code context.
-    """
     _ensure_initialized(req.path)
 
     if not state.llm or not state.llm.client:
@@ -323,17 +328,17 @@ Complete the code:"""
 
     try:
         response = state.llm.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=state.llm.fast_model,   # was hardcoded "gpt-4o-mini"
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.2,
         )
         completion = response.choices[0].message.content.strip()
-        # Strip markdown code fences if present
         if completion.startswith("```"):
             lines = completion.split("\n")
-            completion = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-
+            completion = "\n".join(
+                lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+            )
         return {"completion": completion}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Autocomplete failed: {e}")

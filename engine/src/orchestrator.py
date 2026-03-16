@@ -141,6 +141,8 @@ def execute_action_loop(
             project_structure=project_structure,
             history=history,
             available_tools=available_tools,
+            current_iteration=iteration,
+            max_iterations=max_iterations,
         )
 
         action_type = decision.get("action")
