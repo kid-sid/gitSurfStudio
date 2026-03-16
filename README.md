@@ -9,10 +9,11 @@ GitSurf Studio transforms the power of the GitSurf AI engine into a professional
 ## ✨ Key Features
 
 - 🚀 **Zero Cold-Start AI**: Persistent FastAPI daemon keeps models and search indexes ready in RAM for instant responses.
-- 🤖 **Autonomous PRAR Engine**: A "Perceive-Reason-Act-Reflect" agent that doesn't just chat—it searches code, reads documentation, and applies patches directly.
-- 🐚 **Ultra-Lightweight Frontend**: Built with **Tauri** and **Svelte 5** (Runes) for a native feel with minimal memory footprint compared to Electron-based IDEs.
-- 🌍 **Universal Explorer**: Paste a GitHub URL or a local file path to start exploring even the most complex projects instantly.
-- 💻 **Monaco-Powered Editor**: High-performance code editing with syntax highlighting and a VS Code-inspired interface.
+- 🤖 **Upgraded PRAR Engine**: A "Perceive-Reason-Act-Reflect" agent with enhanced prompt engineering for precise tool usage and target file prediction.
+- 📂 **Multi-Tab Support**: Seamlessly switch between multiple files with a modern VS Code-inspired tabbed interface.
+- 🛡️ **Safe File Editing**: Robust `replace_in_file` tool with occurrence validation and automatic `.bak` backups to prevent accidental code loss.
+- 🧩 **Global Project Context**: Automatic README analysis during initialization to ground AI reasoning in your project's specific jargon and architecture.
+- 🐚 **Ultra-Lightweight Frontend**: Built with **Tauri** and **Svelte 5** (Runes) for a native feel with minimal memory footprint.
 
 ---
 
@@ -71,7 +72,7 @@ npm run tauri dev
 ## 🛠️ Technology Stack
 - **Frontend**: [Svelte 5](https://svelte.dev/) (Runes), [Tauri](https://tauri.app/), [Vite](https://vitejs.dev/)
 - **Backend**: [FastAPI](https://fastapi.tiangolo.com/), [Uvicorn](https://www.uvicorn.org/)
-- **AI Core**: [OpenAI GPT-4o](https://openai.com/), [Ripgrep](https://github.com/BurntSushi/ripgrep), [FAISS](https://github.com/facebookresearch/faiss)
+- **AI Core**: [OpenAI GPT-4o](https://openai.com/), [Ripgrep](https://github.com/BurntSushi/ripgrep), [BM25/FAISS](https://github.com/facebookresearch/faiss)
 
 ## 📄 License
 MIT License. Built with 🌊 by Sidhartha.
