@@ -5,7 +5,9 @@
   import CodeEditor from "./components/CodeEditor.svelte";
   import ChatPanel from "./components/ChatPanel.svelte";
   import StatusBar from "./components/StatusBar.svelte";
-  import { initWorkspace, checkHealth } from "./lib/api.js";
+import ForkButton from "./components/ForkButton.svelte";
+import GitPanel from "./components/GitPanel.svelte";
+  import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./lib/api.js";
 
   let activeFile = $state("");
   let openFiles = $state([]);
@@ -14,14 +16,21 @@
   let isInitializing = $state(false);
   let initError = $state("");
   let initInput = $state("");
+  let isGitHubRepo = $state(false);
+  let isAuthenticated = $state(false);
+  let activeSidebarView = $state("explorer"); // "explorer" or "git"
 
   onMount(async () => {
-    // Initial health check
+    // Initial health and auth check
     engineOnline = await checkHealth();
+    const auth = await checkAuthStatus();
+    isAuthenticated = auth.authenticated;
     
     // Auto-ping engine
     setInterval(async () => {
       engineOnline = await checkHealth();
+      const auth = await checkAuthStatus();
+      isAuthenticated = auth.authenticated;
     }, 10000);
   });
 
@@ -34,6 +43,7 @@
     try {
       const res = await initWorkspace(initInput.trim());
       workspacePath = res.workspace_path;
+      isGitHubRepo = res.is_github;
     } catch (e) {
       initError = e.message;
     } finally {
@@ -56,6 +66,12 @@
     openFiles = [];
     activeFile = "";
   }
+  function handleUICommand(command, args) {
+    if (command === "open_file") {
+      const path = args.trim();
+      handleFileSelect({ detail: { path } });
+    }
+  }
 </script>
 
 <div class="studio-layout">
@@ -72,6 +88,13 @@
       <span class="status-bar__item status-bar__engine" class:online={engineOnline}>
         ● {engineOnline ? "Engine Connected" : "Engine Disconnected"}
       </span>
+      {#if workspacePath}
+        {#if !isAuthenticated}
+          <button class="login-btn" onclick={loginWithGitHub}>🔑 Login with GitHub</button>
+        {:else}
+          <ForkButton {workspacePath} isGitHub={isGitHubRepo} />
+        {/if}
+      {/if}
     </div>
   </header>
 
@@ -108,8 +131,27 @@
   {:else}
     <!-- Main IDE Content -->
     <div class="main-content">
+      <nav class="activity-bar">
+        <button 
+          class="activity-btn" 
+          class:active={activeSidebarView === 'explorer'} 
+          onclick={() => activeSidebarView = 'explorer'}
+          title="Explorer"
+        >📂</button>
+        <button 
+          class="activity-btn" 
+          class:active={activeSidebarView === 'git'} 
+          onclick={() => activeSidebarView = 'git'}
+          title="Source Control"
+        >🌿</button>
+      </nav>
+
       <aside class="sidebar">
-        <FileTree {workspacePath} onfileselect={handleFileSelect} onworkspaceopen={handleWorkspaceOpen} />
+        {#if activeSidebarView === 'explorer'}
+          <FileTree {workspacePath} onfileselect={handleFileSelect} onworkspaceopen={handleWorkspaceOpen} />
+        {:else if activeSidebarView === 'git'}
+          <GitPanel {workspacePath} />
+        {/if}
       </aside>
 
       <main class="editor-area">
@@ -121,7 +163,7 @@
       </main>
 
       <aside class="chat-panel">
-        <ChatPanel {workspacePath} bind:engineOnline />
+        <ChatPanel {workspacePath} bind:engineOnline oncommand={handleUICommand} />
       </aside>
     </div>
   {/if}
@@ -211,6 +253,38 @@
 
   /* Main IDE content styles */
   .main-content { display: flex; flex: 1; overflow: hidden; }
+  
+  .activity-bar {
+    width: 48px;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 10px;
+    gap: 12px;
+  }
+  .activity-btn {
+    background: none; border: none; font-size: 20px; cursor: pointer;
+    opacity: 0.5; transition: opacity 0.2s; padding: 8px; border-radius: 4px;
+    width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
+  }
+  .activity-btn:hover { opacity: 0.8; background: rgba(255,255,255,0.05); }
+  .activity-btn.active { opacity: 1; border-left: 2px solid var(--accent-blue); border-radius: 0; }
+
+  .login-btn {
+    background: #238636;
+    color: white;
+    border: none;
+    padding: 4px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .login-btn:hover { background: #2ea043; }
+
   .sidebar { width: 260px; min-width: 200px; background: var(--bg-secondary); border-right: 1px solid var(--border); overflow-y: auto; }
   .editor-area { flex: 1; min-width: 200px; overflow: hidden; background: var(--bg-primary); }
   .chat-panel { width: 380px; min-width: 300px; background: var(--bg-secondary); border-left: 1px solid var(--border); overflow: hidden; display: flex; flex-direction: column; }

@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { sendChat, checkHealth } from "../lib/api.js";
 
-  let { workspacePath = "", engineOnline = $bindable(false) } = $props();
+  let { workspacePath = "", engineOnline = $bindable(false), oncommand = null } = $props();
 
   let messages = $state([]);
   let inputText = $state("");
@@ -35,13 +35,14 @@
         workspacePath || ".",
         [],
         null,
-        (answerContent) => { answer = answerContent; }
+        (answerContent) => { answer = answerContent; },
+        oncommand
       );
       messages.push({ role: "assistant", content: answer });
     } catch (error) {
       messages.push({
         role: "error",
-        content: `Failed to reach the engine.\n\nStart it with:\ncd engine && uvicorn server:app --port 8000\n\nError: ${error.message}`
+        content: `Failed to reach the engine.\n\nStart it with:\ncd engine && uvicorn server:app --port 8002\n\nError: ${error.message}`
       });
     }
 
