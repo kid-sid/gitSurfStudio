@@ -244,10 +244,23 @@ def run_code_aware_pipeline(
     technical_intent = refined_data.get("intent", "General search")
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
+    direct_tool_call = refined_data.get("direct_tool_call")
 
-    print(f"   Intent: {technical_intent}")
-    if query_to_use != question:
-        print(f"   Refined Question: {query_to_use}")
+    if direct_tool_call:
+        print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")
+        tool_name = direct_tool_call.get("tool")
+        method = direct_tool_call.get("method")
+        args = direct_tool_call.get("args", {})
+        tool_instance = tools.get(tool_name)
+        if tool_instance:
+            fn = getattr(tool_instance, method, None)
+            if fn:
+                try:
+                    observation = fn(**args)
+                    return f"Action taken: {tool_name}.{method}({args})\nObservation: {observation}", ""
+                except Exception as e:
+                    return f"[Error] Fast-Path failed: {e}", ""
+        print("   [Fast-Path] Tool or method not found, falling back to full pipeline.")
 
     top_chunks: List[Dict] = []
     call_graph_context = ""
@@ -490,6 +503,23 @@ def run_local_pipeline(
     query_to_use = refined_data.get("refined_question", question)
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
+    direct_tool_call = refined_data.get("direct_tool_call")
+
+    if direct_tool_call:
+        print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")
+        tool_name = direct_tool_call.get("tool")
+        method = direct_tool_call.get("method")
+        args = direct_tool_call.get("args", {})
+        tool_instance = tools.get(tool_name)
+        if tool_instance:
+            fn = getattr(tool_instance, method, None)
+            if fn:
+                try:
+                    observation = fn(**args)
+                    return f"Action taken: {tool_name}.{method}({args})\nObservation: {observation}", ""
+                except Exception as e:
+                    return f"[Error] Fast-Path failed: {e}", ""
+        print("   [Fast-Path] Tool or method not found, falling back to full pipeline.")
 
     top_chunks: List[Dict] = []
 

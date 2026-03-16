@@ -36,6 +36,8 @@ FIELD INSTRUCTIONS:
 
 "action_type": If is_action_request is true, classify as one of: "edit" | "create" | "delete" | "rename" | "refactor". If is_action_request is false, return null.
 
+"direct_tool_call": A JSON object containing "tool", "method", and "args" ONLY if the request is a simple, unambiguous command (e.g., "Open server.py", "What is in App.svelte?"). If the request requires reasoning, searching, or complex editing, return null.
+
 EXPECTED OUTPUT FORMAT:
 {{
   "intent": "string (verb phrase, max 15 words)",
@@ -43,7 +45,12 @@ EXPECTED OUTPUT FORMAT:
   "keywords": ["str1", "str2", "..."],
   "is_action_request": boolean,
   "target_files": ["filename1", "filename2"],
-  "action_type": "edit" | "create" | "delete" | "rename" | "refactor" | null
+  "action_type": "edit" | "create" | "delete" | "rename" | "refactor" | null,
+  "direct_tool_call": {
+    "tool": "ToolName",
+    "method": "method_name",
+    "args": {"param": "value"}
+  } | null
 }}
 
 Return ONLY the JSON object. No markdown fences. No explanation."""

@@ -74,6 +74,8 @@ class LLMClient:
                             data["target_files"] = []
                         if "action_type" not in data:
                             data["action_type"] = None
+                        if "direct_tool_call" not in data:
+                            data["direct_tool_call"] = None
                         return data
                     except json.JSONDecodeError:
                         pass # Fall through to default

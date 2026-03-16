@@ -79,3 +79,29 @@ class RepoManager:
         except subprocess.CalledProcessError as e:
             print(f"[RepoManager] Error cloning {url}: {e}")
             raise
+    def fork_repo(self, repo_name: str, token: str) -> str:
+        """
+        Forks the given repo using the GitHub API.
+        Returns the HTML URL of the new fork.
+        """
+        import requests
+        if "/tree/" in repo_name:
+            repo_name = repo_name.split("/tree/")[0]
+            
+        url = f"https://api.github.com/repos/{repo_name}/forks"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        print(f"[RepoManager] Sending fork request for: {repo_name}")
+        response = requests.post(url, headers=headers)
+        
+        if response.status_code in [202, 201]:
+            fork_url = response.json().get("html_url")
+            print(f"[RepoManager] Fork initiated: {fork_url}")
+            return fork_url
+        else:
+            error_data = response.json()
+            message = error_data.get("message", "Unknown error")
+            raise Exception(f"GitHub fork failed: {message}")
