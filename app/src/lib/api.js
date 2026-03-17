@@ -3,7 +3,7 @@
  * Bridge between the Svelte frontend and the Python AI Engine.
  */
 
-const ENGINE_URL = "http://127.0.0.1:8000";
+const ENGINE_URL = "http://127.0.0.1:8002";
 
 /**
  * Initializes a workspace (local or GitHub)
@@ -79,12 +79,15 @@ export async function checkHealth() {
  * @param {Array} history - Conversation history
  * @param {Function} onLog - Callback for pipeline logs (thoughts/observations)
  * @param {Function} onAnswer - Callback for the final answer
+ * @param {Function} onCommand - Callback for UI commands (e.g. open_file)
+ * @param {AbortSignal} signal - Optional AbortSignal to cancel the request
  */
-export async function sendChat(query, path, history = [], onLog, onAnswer) {
+export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal) {
   const response = await fetch(`${ENGINE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query, path, history }),
+    signal,
   });
 
   if (!response.ok) {
@@ -109,6 +112,8 @@ export async function sendChat(query, path, history = [], onLog, onAnswer) {
         const data = JSON.parse(line);
         if (data.type === "log" && onLog) {
           onLog(data.content);
+        } else if (data.type === "ui_command" && onCommand) {
+          onCommand(data.command, data.args);
         } else if (data.type === "answer") {
           fullAnswer += data.content;
           if (onAnswer) onAnswer(fullAnswer);
@@ -120,4 +125,78 @@ export async function sendChat(query, path, history = [], onLog, onAnswer) {
   }
 
   return fullAnswer;
+}
+
+/**
+ * Gets the current git status
+ * @param {string} path - Workspace path
+ */
+export async function gitStatus(path) {
+  const response = await fetch(`${ENGINE_URL}/git/status?path=${encodeURIComponent(path)}`);
+  if (!response.ok) throw new Error("Failed to fetch git status");
+  return await response.json();
+}
+
+/**
+ * Stages files for commit
+ * @param {string} path - Workspace path
+ * @param {Array} files - List of relative file paths
+ */
+export async function gitStage(path, files) {
+  const response = await fetch(`${ENGINE_URL}/git/stage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, files }),
+  });
+  if (!response.ok) throw new Error("Failed to stage files");
+  return await response.json();
+}
+
+/**
+ * Commits staged changes
+ * @param {string} path - Workspace path
+ * @param {string} message - Commit message
+ */
+export async function gitCommit(path, message) {
+  const response = await fetch(`${ENGINE_URL}/git/commit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, message }),
+  });
+  if (!response.ok) throw new Error("Failed to commit changes");
+  return await response.json();
+}
+
+/**
+ * Forks a repository
+ * @param {string} path - Current workspace path
+ * @param {string} repoName - Source repository (owner/repo)
+ */
+export async function gitFork(path, repoName) {
+  const response = await fetch(`${ENGINE_URL}/git/fork`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, repo_name: repoName }),
+  });
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.detail || "Fork failed");
+  }
+  return await response.json();
+}
+
+/**
+ * Checks if the user is authenticated with GitHub
+ */
+export async function checkAuthStatus() {
+  const response = await fetch(`${ENGINE_URL}/auth/status`);
+  if (!response.ok) return { authenticated: false };
+  return await response.json();
+}
+
+/**
+ * Initiates the GitHub OAuth login flow
+ */
+export function loginWithGitHub() {
+  window.open(`${ENGINE_URL}/auth/login`, "_blank", "width=600,height=700");
 }

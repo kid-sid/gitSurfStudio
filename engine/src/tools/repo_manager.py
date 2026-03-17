@@ -44,6 +44,8 @@ class RepoManager:
         """
         if "/tree/" in repo_name:
             repo_name = repo_name.split("/tree/")[0]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
         
         safe_name = repo_name.replace("/", "_").replace("\\", "_")
         repo_path = os.path.join(self.cache_dir, safe_name)
@@ -87,6 +89,8 @@ class RepoManager:
         import requests
         if "/tree/" in repo_name:
             repo_name = repo_name.split("/tree/")[0]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
             
         url = f"https://api.github.com/repos/{repo_name}/forks"
         headers = {

@@ -57,7 +57,7 @@ pip install -r requirements.txt
 In one terminal, start the AI Engine:
 ```powershell
 cd engine
-uvicorn server:app --host 127.0.0.1 --port 8000
+uvicorn server:app --host 127.0.0.1 --port 8002
 ```
 
 In another terminal, launch the Desktop App:

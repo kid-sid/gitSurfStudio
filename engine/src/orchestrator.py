@@ -245,6 +245,9 @@ def run_code_aware_pipeline(
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
     direct_tool_call = refined_data.get("direct_tool_call")
+    print(f"   Intent: {technical_intent}")
+    print(f"   Refined to: \"{query_to_use}\"")
+    print(f"   Keywords: {expansion_keywords[:5]}")
 
     if direct_tool_call:
         print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")
@@ -504,6 +507,8 @@ def run_local_pipeline(
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
     direct_tool_call = refined_data.get("direct_tool_call")
+    print(f"   Refined to: \"{query_to_use}\"")
+    print(f"   Keywords: {expansion_keywords[:5]}")
 
     if direct_tool_call:
         print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")

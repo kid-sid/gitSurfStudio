@@ -7,7 +7,9 @@
   let messages = $state([]);
   let inputText = $state("");
   let isLoading = $state(false);
+  let statusText = $state("Thinking...");
   let chatContainer;
+  let abortController = null;
 
   onMount(() => {
     pingEngine();
@@ -26,7 +28,15 @@
     inputText = "";
     messages.push({ role: "user", content: query });
     isLoading = true;
+    statusText = "🚀 Starting...";
+
+    // Push a skeleton assistant message that will be filled in progressively
+    const assistantMsg = { role: "assistant", content: "", thoughts: [], thinking: true };
+    messages.push(assistantMsg);
+    const msgIndex = messages.length - 1;
     setTimeout(scrollToBottom, 50);
+
+    abortController = new AbortController();
 
     try {
       let answer = "";
@@ -34,20 +44,52 @@
         query,
         workspacePath || ".",
         [],
-        null,
+        (logLine) => {
+          // Push log to thoughts array
+          messages[msgIndex].thoughts = [...messages[msgIndex].thoughts, logLine];
+
+          // Update concise status
+          if (logLine.includes("[Step"))
+            statusText = "📋 " + logLine.replace(/^\s*/, "");
+          else if (logLine.includes("Refined to:"))
+            statusText = "🔍 " + logLine.trim();
+          else if (logLine.includes("[Embeddings]") || logLine.includes("Encoding"))
+            statusText = "🧮 Computing embeddings...";
+          else if (logLine.includes("[Action Loop]") || logLine.includes("Iteration"))
+            statusText = "🧠 Reasoning...";
+          else if (logLine.includes("[Fast-Path]"))
+            statusText = "⚡ Fast-Path executing...";
+          else if (logLine.includes("[Smart-Route]"))
+            statusText = "✅ Context ready, generating answer...";
+
+          setTimeout(scrollToBottom, 50);
+        },
         (answerContent) => { answer = answerContent; },
-        oncommand
+        oncommand,
+        abortController.signal
       );
-      messages.push({ role: "assistant", content: answer });
+      messages[msgIndex].content = answer;
     } catch (error) {
-      messages.push({
-        role: "error",
-        content: `Failed to reach the engine.\n\nStart it with:\ncd engine && uvicorn server:app --port 8002\n\nError: ${error.message}`
-      });
+      if (error.name === "AbortError") {
+        messages[msgIndex].content = "_Stopped by user._";
+      } else {
+        messages[msgIndex] = {
+          role: "error",
+          content: `Failed to reach the engine.\n\nStart it with:\ncd engine && uvicorn server:app --port 8002\n\nError: ${error.message}`,
+        };
+      }
     }
 
+    messages[msgIndex].thinking = false;
     isLoading = false;
+    abortController = null;
     setTimeout(scrollToBottom, 50);
+  }
+
+  function handleStop() {
+    if (abortController) {
+      abortController.abort();
+    }
   }
 
   function scrollToBottom() {
@@ -105,18 +147,37 @@
             {msg.role === "user" ? "You" : msg.role === "assistant" ? "GitSurf" : "Error"}
           </span>
         </div>
-        <div class="chat__msg-body">{msg.content}</div>
+
+        <!-- Thought trace (collapsible) -->
+        {#if msg.thoughts && msg.thoughts.length > 0}
+          <details class="chat__thoughts" open={msg.thinking}>
+            <summary class="chat__thoughts-toggle">
+              {msg.thinking ? `⏳ ${statusText}` : `💭 Thought for ${msg.thoughts.length} steps`}
+            </summary>
+            <div class="chat__thoughts-body">
+              {#each msg.thoughts as thought}
+                <div class="chat__thought-line">{thought}</div>
+              {/each}
+            </div>
+          </details>
+        {/if}
+
+        <!-- Loading indicator (only while still thinking and no answer yet) -->
+        {#if msg.thinking && !msg.content}
+          <div class="chat__loading">
+            <div class="chat__loading-dots">
+              <span></span><span></span><span></span>
+            </div>
+            <span>{statusText}</span>
+          </div>
+        {/if}
+
+        <!-- Message body (answer) -->
+        {#if msg.content}
+          <div class="chat__msg-body">{msg.content}</div>
+        {/if}
       </div>
     {/each}
-
-    {#if isLoading}
-      <div class="chat__loading">
-        <div class="chat__loading-dots">
-          <span></span><span></span><span></span>
-        </div>
-        <span>Thinking...</span>
-      </div>
-    {/if}
   </div>
 
   <div class="chat__input-area">
@@ -128,9 +189,15 @@
       rows="2"
       disabled={isLoading}
     ></textarea>
-    <button class="chat__send" onclick={handleSend} disabled={isLoading || !inputText.trim()}>
-      ➤
-    </button>
+    {#if isLoading}
+      <button class="chat__stop" onclick={handleStop} title="Stop generation">
+        ■
+      </button>
+    {:else}
+      <button class="chat__send" onclick={handleSend} disabled={!inputText.trim()}>
+        ➤
+      </button>
+    {/if}
   </div>
 </div>
 
@@ -191,6 +258,54 @@
     color: var(--accent-red);
   }
 
+  /* ── Thought trace ── */
+  .chat__thoughts {
+    border: 1px solid rgba(139, 148, 158, 0.15);
+    border-radius: var(--radius-md);
+    background: rgba(22, 27, 34, 0.6);
+    overflow: hidden;
+    margin-top: 2px;
+  }
+  .chat__thoughts-toggle {
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .chat__thoughts-toggle::-webkit-details-marker { display: none; }
+  .chat__thoughts-toggle::before {
+    content: "▶";
+    font-size: 8px;
+    transition: transform 0.15s ease;
+  }
+  details[open] > .chat__thoughts-toggle::before {
+    transform: rotate(90deg);
+  }
+  .chat__thoughts-body {
+    padding: 6px 10px 8px;
+    max-height: 200px;
+    overflow-y: auto;
+    border-top: 1px solid rgba(139, 148, 158, 0.1);
+  }
+  .chat__thought-line {
+    font-family: var(--font-mono, 'Consolas', 'Monaco', monospace);
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    padding: 1px 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .chat__thought-line:nth-child(odd) {
+    color: rgba(139, 148, 158, 0.8);
+  }
+
+  /* ── Loading dots ── */
   .chat__loading {
     display: flex; align-items: center; gap: 8px; padding: 8px 12px;
     color: var(--text-secondary); font-size: 12px;
@@ -207,6 +322,7 @@
     40% { opacity: 1; transform: scale(1.2); }
   }
 
+  /* ── Input area ── */
   .chat__input-area {
     display: flex; gap: 8px; padding: 12px;
     border-top: 1px solid var(--border); background: var(--bg-secondary);
@@ -226,4 +342,19 @@
   }
   .chat__send:hover:not(:disabled) { background: #79b8ff; }
   .chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Stop button ── */
+  .chat__stop {
+    width: 36px; height: 36px; align-self: flex-end;
+    border-radius: var(--radius-md); background: var(--accent-red, #f85149);
+    color: white; font-size: 14px; font-weight: bold;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; border: none;
+    animation: pulse-red 1.5s infinite ease-in-out;
+  }
+  .chat__stop:hover { background: #da3633; }
+  @keyframes pulse-red {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(248, 81, 73, 0.4); }
+    50% { box-shadow: 0 0 0 6px rgba(248, 81, 73, 0); }
+  }
 </style>
