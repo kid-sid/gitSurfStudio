@@ -67,6 +67,55 @@ npm install
 npm run tauri dev
 ```
 
+### 4. 🐳 Run with Docker (Recommended)
+
+**First-time setup:**
+
+On **Windows (PowerShell):**
+```powershell
+# 1. Create your .env from the template
+Copy-Item .env.example .env
+
+# 2. Open and fill in your real API keys (at minimum: OPENAI_API_KEY)
+notepad .env
+
+# 3. Build and start
+docker compose up --build
+```
+
+On **Mac / Linux:**
+```bash
+cp .env.example .env
+nano .env   # add your real OPENAI_API_KEY
+docker compose up --build
+```
+
+**Day-to-day (images already built):**
+```powershell
+docker compose up
+docker compose down
+docker compose restart
+```
+
+**Rebuild only the backend** (e.g. after a dependency change):
+```powershell
+docker compose up --build backend
+```
+
+**View live logs:**
+```powershell
+docker compose logs -f backend
+docker compose logs -f frontend
+```
+
+| Service | URL |
+|---------|-----|
+| 🌐 Frontend (Svelte UI) | http://localhost |
+| ⚙️ Backend (AI Engine) | http://localhost:8002 |
+| ❤️ Health check | http://localhost:8002/health |
+
+> **Minimum required:** Only `OPENAI_API_KEY` is needed to start. `GITHUB_TOKEN`, `GITHUB_CLIENT_ID/SECRET`, and `TAVILY_API_KEY` are optional.
+
 ---
 
 ## 🛠️ Technology Stack

@@ -1,0 +1,28 @@
+services:
+  backend:
+    build:
+      context: ./engine
+    ports:
+      - "8002:8002"
+    env_file:
+      - .env
+    # Hot-reload: mount source so code changes reflect without rebuild.
+    # A named volume keeps the index cache across restarts.
+    volumes:
+      - ./engine:/app
+      - engine_cache:/app/.cache
+    command: uvicorn server:app --host 0.0.0.0 --port 8002 --reload
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./app
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  # Persist FAISS/BM25/symbol cache so it survives container restarts
+  engine_cache:

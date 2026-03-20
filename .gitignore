@@ -12,6 +12,9 @@ engine/.gitsurf_history.json
 engine/faiss_index/
 engine/symbol_minimap.json
 
+# --- Secrets (root .env must NEVER be committed) ---
+/.env
+
 # --- Node / Svelte Frontend ---
 app/node_modules/
 app/dist/
