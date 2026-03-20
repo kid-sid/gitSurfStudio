@@ -29,6 +29,10 @@ class PipelineContext:
         self.search_path = os.path.abspath(search_path)
         self.rebuild_index = rebuild_index
 
+        # Resolve cache dirs relative to the engine directory, not CWD
+        _engine_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._cache_base = os.path.join(_engine_dir, ".cache")
+
         # Lazily initialized tools (populated on first search query)
         self._emb_client = None
         self._vector_tool = None
@@ -52,26 +56,26 @@ class PipelineContext:
         if self._vector_tool is None:
             self._vector_tool = VectorSearchTool(
                 embedding_client=self.emb_client,
-                cache_dir=os.path.join(".cache", "vector_index"),
+                cache_dir=os.path.join(self._cache_base, "vector_index"),
             )
         return self._vector_tool
 
     @property
     def bm25_tool(self):
         if self._bm25_tool is None:
-            self._bm25_tool = BM25SearchTool(cache_dir=os.path.join(".cache", "bm25_index"))
+            self._bm25_tool = BM25SearchTool(cache_dir=os.path.join(self._cache_base, "bm25_index"))
         return self._bm25_tool
 
     @property
     def sym_extractor(self):
         if self._sym_extractor is None:
-            self._sym_extractor = SymbolExtractor(cache_dir=os.path.join(".cache", "symbols"))
+            self._sym_extractor = SymbolExtractor(cache_dir=os.path.join(self._cache_base, "symbols"))
         return self._sym_extractor
 
     @property
     def call_graph(self):
         if self._call_graph is None:
-            self._call_graph = CallGraph(cache_dir=os.path.join(".cache", "call_graph"))
+            self._call_graph = CallGraph(cache_dir=os.path.join(self._cache_base, "call_graph"))
         return self._call_graph
 
     @property

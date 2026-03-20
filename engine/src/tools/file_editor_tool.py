@@ -78,13 +78,13 @@ class FileEditorTool:
                 return f"[Error] File not found: {rel_path}"
 
             with open(abs_path, "r", encoding="utf-8") as f:
-                    original_content = f.read()
+                original_content = f.read()
 
             # ── Occurrence check ─────────────────────────────────────────
             count = original_content.count(target)
 
             if count == 0:
-                    return (
+                return (
                     f"[Error] Target string not found in {rel_path}. "
                     f"The file may have changed since it was read. "
                     f"Use read_file() to get the current content before retrying."

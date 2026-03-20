@@ -46,11 +46,11 @@ EXPECTED OUTPUT FORMAT:
   "is_action_request": boolean,
   "target_files": ["filename1", "filename2"],
   "action_type": "edit" | "create" | "delete" | "rename" | "refactor" | null,
-  "direct_tool_call": {
+  "direct_tool_call": {{
     "tool": "ToolName",
     "method": "method_name",
-    "args": {"param": "value"}
-  } | null
+    "args": {{"param": "value"}}
+  }} | null
 }}
 
 Return ONLY the JSON object. No markdown fences. No explanation."""
@@ -83,7 +83,7 @@ Select precisely.
 ---
 
 TASK:
-Identify the 3–8 files most likely to contain the code needed to answer or act on the user's request.
+Identify the 3-8 files most likely to contain the code needed to answer or act on the user's request.
 Return ONLY a valid JSON array of exact file paths as they appear in <file_structure>.
 No explanation. No markdown. No commentary.
 
@@ -431,13 +431,6 @@ RULES:
 
 <question>{user_question}</question>"""
 
-def analyze_project_context_prompt(readme_content: str) -> str:
-    return f"""Summarize this README into < 200 words focusing on Purpose, Key Components, and Jargon.
-
-<readme>
-{readme_content[:1500]}
-</readme>"""
-
 def generate_questions_prompt(context: str, num: int) -> str:
     return f"""Generate {num} insightful technical questions for a new developer based on the context.
 
@@ -448,45 +441,6 @@ FORMAT:
 <context>
 {context}
 </context>"""
-
-def decide_action_prompt(user_question: str, context: str, history_str: str, project_structure: str, available_tools: str) -> str:
-    return f"""You are an autonomous AI software engineer. Decide the next action. Return ONLY valid JSON.
-
-<available_tools>
-{available_tools}
-</available_tools>
-
-<project_structure>
-{project_structure[:5000]}
-</project_structure>
-
-<current_context>
-{context[:20000]}
-</current_context>
-
-{history_str}
-<user_request>{user_question}</user_request>
-
-TASK:
-Choose exactly one option:
-1. action: "tool_call" (if you need to edit, read, or search)
-2. action: "final_answer" (if you have gathered enough info to fulfill the request)
-
-TOOL CALL JSON FORMAT:
-{{
-  "action": "tool_call",
-  "tool": "ToolName",
-  "method": "method_name",
-  "args": {{"param": "value"}},
-  "thought": "Reasoning here."
-}}
-
-FINAL ANSWER JSON FORMAT:
-{{
-  "action": "final_answer",
-  "content": "Final response text here.",
-  "thought": "Reasoning here."
-}}"""
 
 def verify_answer_prompt(question: str, answer: str, context: str) -> str:
     return f"""Verify the AI answer strictly against the codebase context. Return ONLY valid JSON.
@@ -504,61 +458,6 @@ EXPECTED JSON FORMAT:
   "confidence_score": 0.9,
   "reasoning": "Explanation here",
   "suggested_correction": "Required if FAIL/PARTIAL"
-}}"""
-
-def decide_action_prompt(
-    user_question: str,
-    context: str,
-    history_str: str,
-    project_structure: str,
-    available_tools: str,
-    current_iteration: int = 1,
-    max_iterations: int = 5
-) -> str:
-    return f"""You are an autonomous software agent inside GitSurf Studio.
-You are on iteration {current_iteration} of {max_iterations}.
-{"WARNING: This is your LAST iteration. You MUST return final_answer now." if current_iteration >= max_iterations else ""}
-
-<available_tools>
-{available_tools}
-</available_tools>
-
-<project_structure>
-{project_structure[:3000]}
-</project_structure>
-
-<accumulated_context>
-{context[:18000]}
-</accumulated_context>
-
-{history_str}
-
-<user_request>{user_question}</user_request>
-
-DECISION RULES:
-- If the accumulated_context already contains enough information to fully answer
-  the user's request: return final_answer immediately. Do not call more tools.
-- If a tool call in the context returned [Error]: do not retry the same call.
-  Either try a different method or return final_answer with what you know.
-- If you are on the last iteration: return final_answer regardless.
-- Never call the same tool.method with the same args twice.
-
-Return ONLY one of these two JSON shapes — nothing else:
-
-TOOL CALL:
-{{
-  "action": "tool_call",
-  "tool": "<exact tool name from available_tools>",
-  "method": "<exact method name>",
-  "args": {{"<param>": "<value>"}},
-  "thought": "<one sentence: what you expect to learn from this call>"
-}}
-
-FINAL ANSWER:
-{{
-  "action": "final_answer",
-  "content": "<your complete response to the user>",
-  "thought": "<one sentence: why you have enough context to answer now>"
 }}"""
 
 def decide_action_prompt(

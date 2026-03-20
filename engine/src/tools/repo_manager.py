@@ -76,7 +76,7 @@ class RepoManager:
 
     def _clone(self, url: str, path: str):
         try:
-            subprocess.run(["git", "clone", "--depth", "1", url, path], check=True)
+            subprocess.run(["git", "clone", "--depth", "1", "--no-single-branch", url, path], check=True)
             print(f"[RepoManager] Cloned {url} to {path}.")
         except subprocess.CalledProcessError as e:
             print(f"[RepoManager] Error cloning {url}: {e}")

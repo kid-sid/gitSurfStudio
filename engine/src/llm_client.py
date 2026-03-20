@@ -27,6 +27,12 @@ class LLMClient:
         self.provider = provider
         self.api_key = None
         self.client = None
+
+        # ── Central model config ──────────────────────────────────────
+        self.fast_model = "gpt-4o-mini"        # cheap/fast calls (query refinement, file targeting)
+        self.reasoning_model = "gpt-4o"        # reasoning-heavy calls (search queries, action loop)
+        # ──────────────────────────────────────────────────────────────
+
         if self.provider == "openai":
             self.api_key = os.getenv("OPENAI_API_KEY")
             if self.api_key:
@@ -52,7 +58,7 @@ class LLMClient:
         if self.provider == "openai" and self.client:
             try:
                 response = self.client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=self.fast_model,
                     messages=[{"role": "system", "content": "You are a helpful assistant. Return ONLY valid JSON."},
                               {"role": "user", "content": prompt}],
                     temperature=0.1
@@ -126,7 +132,7 @@ class LLMClient:
         if self.provider == "openai" and self.client:
             try:
                 response = self.client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=self.fast_model,
                     messages=[{"role": "system", "content": "You are a helpful assistant. Return ONLY valid JSON."},
                               {"role": "user", "content": prompt}],
                     temperature=0.1
@@ -159,6 +165,8 @@ class LLMClient:
         history: List[Dict] = None,
         project_context: str = "",
         file_structure: str = "",
+        repo_name: str = "",
+        language_hint: str = "",
     ) -> List[str]:
         if self.provider == "mock":
             words = user_question.split()
@@ -266,7 +274,7 @@ in that file.\n"""
         if self.provider == "openai" and self.client:
             try:
                 response = self.client.chat.completions.create(
-                    model="gpt-4o",
+                    model=self.reasoning_model,
                     messages=[
                         {
                             "role": "system",
@@ -359,7 +367,7 @@ in that file.\n"""
         if self.provider == "openai" and self.client:
             try:
                 response = self.client.chat.completions.create(
-                    model="gpt-4o",
+                    model=self.reasoning_model,
                     messages=[{"role": "system", "content": "You are a helpful assistant."},
                               {"role": "user", "content": prompt}]
                 )

@@ -17,7 +17,10 @@ from typing import Optional, List, Dict
 from contextlib import redirect_stdout
 import queue
 from dotenv import load_dotenv
-load_dotenv()
+
+# Try to load .env from current directory, then from parent (project root)
+if not load_dotenv():
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -250,6 +253,61 @@ async def git_commit(req: GitCommitRequest):
     result = state.git_tool.commit(req.message)
     return {"message": result}
 
+@app.get("/git/branch")
+async def git_branch(path: str):
+    _ensure_initialized(path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    return git_tool.get_branches()
+
+class GitCheckoutRequest(BaseModel):
+    path: str
+    branch: str
+
+@app.post("/git/checkout")
+async def git_checkout(req: GitCheckoutRequest):
+    _ensure_initialized(req.path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    try:
+        result = git_tool.checkout_branch(req.branch)
+        return {"message": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class GitStashRequest(BaseModel):
+    path: str
+
+@app.post("/git/stash")
+async def git_stash(req: GitStashRequest):
+    _ensure_initialized(req.path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    try:
+        result = git_tool.stash_changes()
+        return {"message": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class GitDiscardRequest(BaseModel):
+    path: str
+    file: str
+
+@app.post("/git/discard")
+async def git_discard(req: GitDiscardRequest):
+    _ensure_initialized(req.path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    try:
+        result = git_tool.discard_changes(req.file)
+        return {"message": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/git/fork")
 async def git_fork(req: GitForkRequest):
     _ensure_initialized(req.path)
@@ -366,12 +424,20 @@ async def write_file(req: WriteRequest):
     
     # Safety check: Ensure the path is within the workspace if one is active
     if state.workspace_path:
-        if not abs_path.startswith(state.workspace_path):
-             raise HTTPException(status_code=403, detail="Path outside of workspace")
+        try:
+            # commonpath is safe: /workspace/foo won't match /workspace/foobar
+            common = os.path.commonpath([abs_path, state.workspace_path])
+            if common != state.workspace_path:
+                raise HTTPException(status_code=403, detail="Path outside of workspace")
+        except ValueError:
+            # commonpath raises ValueError on Windows when paths are on different drives
+            raise HTTPException(status_code=403, detail="Path outside of workspace")
     
     try:
-        # Ensure directories exist
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        # Ensure parent directories exist (dirname is empty for root-level paths)
+        parent_dir = os.path.dirname(abs_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         
         # Use FileEditorTool if it exists to preserve its logic (e.g. rel_path handling)
         if state.workspace_path and "FileEditorTool" in state.agent_tools:
@@ -423,23 +489,30 @@ async def chat(req: ChatRequest):
 
         def run_pipeline():
             writer = QueueWriter(log_queue)
-            with redirect_stdout(writer):
-                answer, context = run_local_pipeline(
-                    question=req.query,
-                    search_path=req.path,
-                    llm=state.llm,
-                    project_context=state.project_context,
-                    available_tools=AVAILABLE_TOOLS,
-                    tools=state.agent_tools,
-                    history=req.history,
-                    ctx=state.pipeline_ctx,
-                )
-            writer.flush()
-            result_holder["answer"] = answer
-            result_holder["context"] = context
-            log_queue.put(None)  # Sentinel: pipeline done
+            try:
+                with redirect_stdout(writer):
+                    answer, context = run_local_pipeline(
+                        question=req.query,
+                        search_path=req.path,
+                        llm=state.llm,
+                        project_context=state.project_context,
+                        available_tools=AVAILABLE_TOOLS,
+                        tools=state.agent_tools,
+                        history=req.history,
+                        ctx=state.pipeline_ctx,
+                    )
+                writer.flush()
+                result_holder["answer"] = answer
+                result_holder["context"] = context
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                result_holder["answer"] = f"Pipeline error: {e}"
+                result_holder["context"] = ""
+            finally:
+                log_queue.put(None)  # Sentinel: ALWAYS signal completion
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.run_in_executor(None, run_pipeline)
 
         # Poll the queue and yield each log line in real-time
