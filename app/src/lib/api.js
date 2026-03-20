@@ -3,7 +3,9 @@
  * Bridge between the Svelte frontend and the Python AI Engine.
  */
 
-const ENGINE_URL = "http://127.0.0.1:8002";
+const ENGINE_URL = (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1")
+  ? `${window.location.protocol}//${window.location.hostname}:8002`
+  : "http://127.0.0.1:8002";
 
 /**
  * Initializes a workspace (local or GitHub)
@@ -168,6 +170,34 @@ export async function gitCommit(path, message) {
 }
 
 /**
+ * Gets the current branch and all branches
+ * @param {string} path - Workspace path
+ */
+export async function getBranches(path) {
+  const response = await fetch(`${ENGINE_URL}/git/branch?path=${encodeURIComponent(path)}`);
+  if (!response.ok) throw new Error("Failed to fetch branches");
+  return await response.json();
+}
+
+/**
+ * Checks out a specific branch
+ * @param {string} path - Workspace path
+ * @param {string} branch - Branch name
+ */
+export async function checkoutBranch(path, branch) {
+  const response = await fetch(`${ENGINE_URL}/git/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, branch }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to checkout branch");
+  }
+  return await response.json();
+}
+
+/**
  * Forks a repository
  * @param {string} path - Current workspace path
  * @param {string} repoName - Source repository (owner/repo)
@@ -199,4 +229,55 @@ export async function checkAuthStatus() {
  */
 export function loginWithGitHub() {
   window.open(`${ENGINE_URL}/auth/login`, "_blank", "width=600,height=700");
+}
+/**
+ * Stashes local changes
+ * @param {string} path - Workspace path
+ */
+export async function gitStash(path) {
+  const response = await fetch(`${ENGINE_URL}/git/stash`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to stash changes");
+  }
+  return await response.json();
+}
+
+/**
+ * Pops the latest stash
+ * @param {string} path - Workspace path
+ */
+export async function gitStashPop(path) {
+  const response = await fetch(`${ENGINE_URL}/git/stash/pop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to pop stash");
+  }
+  return await response.json();
+}
+
+/**
+ * Discards local changes to a file
+ * @param {string} path - Workspace path
+ * @param {string} file - Relative file path
+ */
+export async function gitDiscard(path, file) {
+  const response = await fetch(`${ENGINE_URL}/git/discard`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, file }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to discard changes");
+  }
+  return await response.json();
 }

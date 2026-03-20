@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { gitStatus, gitStage, gitCommit } from "../lib/api";
+  import { gitStatus, gitStage, gitCommit, getBranches, checkoutBranch, gitStash, gitStashPop, gitDiscard } from "../lib/api";
 
   let { workspacePath = "" } = $props();
 
@@ -8,14 +8,40 @@
   let commitMessage = $state("");
   let loading = $state(false);
   let error = $state("");
+  let currentBranch = $state("");
+  let branches = $state([]);
+  let isSwitchingBranch = $state(false);
 
   async function refreshStatus() {
     if (!workspacePath) return;
     try {
+      const branchData = await getBranches(workspacePath);
+      currentBranch = branchData.current || "unknown";
+      branches = branchData.branches || [];
+      
       const result = await gitStatus(workspacePath);
       changes = result.status;
     } catch (e) {
       error = "Failed to load git status";
+    }
+  }
+
+  async function handleBranchChange(e) {
+    const newBranch = e.target.value;
+    if (newBranch && newBranch !== currentBranch) {
+      isSwitchingBranch = true;
+      try {
+        await checkoutBranch(workspacePath, newBranch);
+        await refreshStatus();
+        // Fire custom event so parent can refresh file tree
+        window.dispatchEvent(new CustomEvent('branch-changed'));
+      } catch (err) {
+        error = err.message || `Failed to checkout ${newBranch}`;
+        // Revert select back to current branch
+        e.target.value = currentBranch;
+      } finally {
+        isSwitchingBranch = false;
+      }
     }
   }
 
@@ -42,6 +68,40 @@
     }
   }
 
+  async function handleStash() {
+    loading = true;
+    try {
+      await gitStash(workspacePath);
+      await refreshStatus();
+    } catch (e) {
+      error = "Stash failed: " + e.message;
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function handlePop() {
+    loading = true;
+    try {
+      await gitStashPop(workspacePath);
+      await refreshStatus();
+    } catch (e) {
+      error = "Pop failed: " + e.message;
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function handleDiscard(path) {
+    if (!confirm(`Are you sure you want to discard changes to ${path}?`)) return;
+    try {
+      await gitDiscard(workspacePath, path);
+      await refreshStatus();
+    } catch (e) {
+      error = "Failed to discard changes: " + e.message;
+    }
+  }
+
   onMount(() => {
     refreshStatus();
   });
@@ -54,8 +114,21 @@
 
 <div class="git-panel">
   <div class="panel-header">
-    <h3>Source Control</h3>
-    <button class="refresh-btn" onclick={refreshStatus} title="Refresh Status">🔄</button>
+    <div class="header-left">
+      <h3>Source Control</h3>
+      {#if currentBranch}
+        <select class="branch-select" value={currentBranch} onchange={handleBranchChange} disabled={isSwitchingBranch}>
+          {#each branches as branch}
+            <option value={branch}>{branch}</option>
+          {/each}
+        </select>
+      {/if}
+    </div>
+    <div class="header-right">
+      <button class="action-btn" onclick={handleStash} title="Stash All Changes">📥</button>
+      <button class="action-btn" onclick={handlePop} title="Pop Latest Stash">📤</button>
+      <button class="refresh-btn" onclick={refreshStatus} title="Refresh Status">🔄</button>
+    </div>
   </div>
 
   <div class="changes-list">
@@ -69,7 +142,10 @@
             {change.status.trim() || 'M'}
           </span>
           <span class="file-path" title={change.path}>{change.path.split('/').pop()}</span>
-          <button class="stage-btn" onclick={() => handleStage(change.path)} title="Stage Change">+</button>
+          <div class="change-actions">
+            <button class="action-item-btn discard" onclick={() => handleDiscard(change.path)} title="Discard Changes">↩</button>
+            <button class="action-item-btn stage" onclick={() => handleStage(change.path)} title="Stage Change">+</button>
+          </div>
         </div>
       {/each}
     {/if}
@@ -110,6 +186,11 @@
     align-items: center;
     border-bottom: 1px solid #30363d;
   }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
   .panel-header h3 {
     margin: 0;
     font-size: 11px;
@@ -117,10 +198,32 @@
     letter-spacing: 0.5px;
     color: #8b949e;
   }
-  .refresh-btn {
-    background: none; border: none; cursor: pointer; color: #8b949e; font-size: 14px;
+  .branch-select {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    outline: none;
+    max-width: 120px;
+    text-overflow: ellipsis;
   }
-  .refresh-btn:hover { color: white; }
+  .branch-select:hover:not(:disabled) {
+    border-color: #8b949e;
+  }
+  .branch-select:disabled {
+    opacity: 0.5;
+    cursor: wait;
+  }
+  .refresh-btn, .action-btn {
+    background: none; border: none; cursor: pointer; color: #8b949e; font-size: 14px;
+    padding: 4px;
+    border-radius: 4px;
+    transition: background 0.2s;
+  }
+  .refresh-btn:hover, .action-btn:hover { background: #21262d; color: white; }
 
   .changes-list {
     flex: 1;
@@ -164,14 +267,22 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .stage-btn {
+  .change-actions {
+    display: flex;
+    gap: 4px;
     opacity: 0;
-    background: none; border: none; color: #8b949e; cursor: pointer; font-size: 16px;
   }
-  .change-item:hover .stage-btn {
+  .change-item:hover .change-actions {
     opacity: 1;
   }
-  .stage-btn:hover { color: white; }
+  .action-item-btn {
+    background: none; border: none; color: #8b949e; cursor: pointer; font-size: 14px;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+  .action-item-btn:hover { background: #30363d; color: white; }
+  .action-item-btn.discard:hover { color: #f85149; }
+  .action-item-btn.stage:hover { color: #3fb950; }
 
   .commit-section {
     padding: 12px;

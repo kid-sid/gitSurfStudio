@@ -1,10 +1,23 @@
 <script>
+  import { onMount, onDestroy } from "svelte";
   import { readFile, writeFile } from "../lib/api.js";
 
   let { activeFile = $bindable(""), openFiles = $bindable([]), workspacePath = "" } = $props();
 
-  // state per file: { [path]: { content, original, isLoading, isSaving, error, saveStatus } }
+  // state per file: mapping path to file data
   let filesState = $state({});
+
+  onMount(() => {
+    const handleBranchChange = () => {
+      console.log("Branch changed, clearing editor cache...");
+      filesState = {}; // Clear all cache
+      if (activeFile) {
+        loadContent(activeFile);
+      }
+    };
+    window.addEventListener('branch-changed', handleBranchChange);
+    return () => window.removeEventListener('branch-changed', handleBranchChange);
+  });
 
   // Re-fetch when activeFile changes if not already loaded
   $effect(() => {

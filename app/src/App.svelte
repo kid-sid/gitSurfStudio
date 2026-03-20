@@ -72,6 +72,14 @@ import GitPanel from "./components/GitPanel.svelte";
       handleFileSelect({ detail: { path } });
     }
   }
+
+  function goHome() {
+    workspacePath = "";
+    activeFile = "";
+    openFiles = [];
+    isGitHubRepo = false;
+    initInput = "";
+  }
 </script>
 
 <div class="studio-layout">
@@ -82,6 +90,9 @@ import GitPanel from "./components/GitPanel.svelte";
       <span class="title-bar__name">GitSurf Studio</span>
     </div>
     <div class="title-bar__center">
+      {#if workspacePath}
+        <button class="home-btn" onclick={goHome} title="Go to Home">🏠</button>
+      {/if}
       <span class="title-bar__file">{activeFile || workspacePath || "Welcome"}</span>
     </div>
     <div class="title-bar__right">
@@ -288,4 +299,28 @@ import GitPanel from "./components/GitPanel.svelte";
   .sidebar { width: 260px; min-width: 200px; background: var(--bg-secondary); border-right: 1px solid var(--border); overflow-y: auto; }
   .editor-area { flex: 1; min-width: 200px; overflow: hidden; background: var(--bg-primary); }
   .chat-panel { width: 380px; min-width: 300px; background: var(--bg-secondary); border-left: 1px solid var(--border); overflow: hidden; display: flex; flex-direction: column; }
+
+  .home-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 2px 6px;
+    margin-right: 12px;
+    font-size: 14px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all var(--transition);
+  }
+  .home-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--accent-blue);
+    transform: translateY(-1px);
+  }
+  .home-btn:active {
+    transform: translateY(0);
+  }
 </style>
