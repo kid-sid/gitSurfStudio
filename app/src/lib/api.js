@@ -281,3 +281,17 @@ export async function gitDiscard(path, file) {
   }
   return await response.json();
 }
+
+/**
+ * Fetches symbols for a given path
+ * @param {string} path - Absolute path to the file or directory
+ * @param {string} workspace - Optional workspace root to resolve relative path
+ */
+export async function getSymbols(path, workspace) {
+  let url = `${ENGINE_URL}/symbols?path=${encodeURIComponent(path)}`;
+  if (workspace) url += `&workspace=${encodeURIComponent(workspace)}`;
+  
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("Failed to fetch symbols");
+  return await response.json();
+}

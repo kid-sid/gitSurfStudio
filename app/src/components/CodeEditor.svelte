@@ -15,8 +15,40 @@
         loadContent(activeFile);
       }
     };
+
+    const handleNavigate = (e) => {
+      const { path, line } = e.detail;
+      if (path === activeFile) {
+        // Find the textarea and scroll to the line
+        const textarea = document.querySelector('.editor__textarea');
+        if (textarea) {
+          const lines = textarea.value.split('\n');
+          let charOffset = 0;
+          for (let i = 0; i < Math.min(line - 1, lines.length); i++) {
+            charOffset += lines[i].length + 1;
+          }
+          textarea.focus();
+          textarea.setSelectionRange(charOffset, charOffset);
+          // Simple scroll approximation (since it's a textarea)
+          const lineHeight = 20; // from CSS
+          textarea.scrollTop = (line - 1) * lineHeight;
+        }
+      } else {
+          // If the file is not active, Svelte's reactivity might take a moment to mount the textarea.
+          // In App.svelte I already ensure it opens, but let's wait a bit and try to navigate.
+          setTimeout(() => {
+              if (activeFile === path) handleNavigate(e);
+          }, 100);
+      }
+    };
+
     window.addEventListener('branch-changed', handleBranchChange);
-    return () => window.removeEventListener('branch-changed', handleBranchChange);
+    window.addEventListener('navigate-to-line', handleNavigate);
+
+    return () => {
+      window.removeEventListener('branch-changed', handleBranchChange);
+      window.removeEventListener('navigate-to-line', handleNavigate);
+    };
   });
 
   // Re-fetch when activeFile changes if not already loaded
@@ -83,6 +115,7 @@
       }, 0);
     }
   }
+
 
   function handleCloseTab(path, e) {
     e.stopPropagation();

@@ -31,7 +31,7 @@
     statusText = "🚀 Starting...";
 
     // Push a skeleton assistant message that will be filled in progressively
-    const assistantMsg = { role: "assistant", content: "", thoughts: [], thinking: true };
+    const assistantMsg = { role: "assistant", content: "", thoughts: [], thinking: true, stepCount: 0 };
     messages.push(assistantMsg);
     const msgIndex = messages.length - 1;
     setTimeout(scrollToBottom, 50);
@@ -48,9 +48,14 @@
           // Push log to thoughts array
           messages[msgIndex].thoughts = [...messages[msgIndex].thoughts, logLine];
 
+          // Increment step count
+          if (logLine.includes("[Step")) {
+            messages[msgIndex].stepCount++;
+          }
+
           // Update concise status
           if (logLine.includes("[Step"))
-            statusText = "📋 " + logLine.replace(/^\s*/, "");
+            statusText = `Step ${messages[msgIndex].stepCount}: ` + logLine.split("] ").pop();
           else if (logLine.includes("Refined to:"))
             statusText = "🔍 " + logLine.trim();
           else if (logLine.includes("[Embeddings]") || logLine.includes("Encoding"))
@@ -148,18 +153,36 @@
           </span>
         </div>
 
-        <!-- Thought trace (collapsible) -->
+        <!-- Enhanced Activity Feed & Reasoning -->
         {#if msg.thoughts && msg.thoughts.length > 0}
-          <details class="chat__thoughts" open={msg.thinking}>
-            <summary class="chat__thoughts-toggle">
-              {msg.thinking ? `⏳ ${statusText}` : `💭 Thought for ${msg.thoughts.length} steps`}
-            </summary>
-            <div class="chat__thoughts-body">
-              {#each msg.thoughts as thought}
-                <div class="chat__thought-line">{thought}</div>
-              {/each}
+          <div class="chat__activity" class:chat__activity--thinking={msg.thinking}>
+            <div class="chat__activity-header">
+              <span class="chat__activity-title">
+                {msg.thinking ? "⚙️ Processing..." : "✅ Completed"}
+              </span>
+              {#if msg.stepCount > 0}
+                <span class="chat__activity-steps">
+                  {msg.stepCount} {msg.stepCount === 1 ? 'step' : 'steps'}
+                </span>
+              {/if}
             </div>
-          </details>
+            
+            <div class="chat__activity-log">
+              {#each msg.thoughts.slice(-3) as thought}
+                <div class="chat__activity-line">{thought}</div>
+              {/each}
+              {#if msg.thoughts.length > 3}
+                <details class="chat__activity-details">
+                  <summary>View full log ({msg.thoughts.length} lines)</summary>
+                  <div class="chat__activity-full">
+                    {#each msg.thoughts as thought}
+                      <div class="chat__activity-line">{thought}</div>
+                    {/each}
+                  </div>
+                </details>
+              {/if}
+            </div>
+          </div>
         {/if}
 
         <!-- Loading indicator (only while still thinking and no answer yet) -->
@@ -258,51 +281,79 @@
     color: var(--accent-red);
   }
 
-  /* ── Thought trace ── */
-  .chat__thoughts {
-    border: 1px solid rgba(139, 148, 158, 0.15);
+  /* ── Activity Feed (Enhanced Reasoning) ── */
+  .chat__activity {
+    margin: 4px 0 8px;
+    background: rgba(48, 54, 61, 0.4);
+    border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    background: rgba(22, 27, 34, 0.6);
     overflow: hidden;
-    margin-top: 2px;
+    transition: all 0.3s ease;
   }
-  .chat__thoughts-toggle {
+  .chat__activity--thinking {
+    border-color: rgba(56, 139, 253, 0.4);
+    background: rgba(56, 139, 253, 0.05);
+  }
+  .chat__activity-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
     padding: 6px 10px;
+    background: rgba(48, 54, 61, 0.2);
+    border-bottom: 1px solid rgba(240, 246, 252, 0.05);
+  }
+  .chat__activity-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .chat__activity-steps {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: rgba(56, 139, 253, 0.15);
+    color: var(--text-accent);
+    border-radius: 10px;
+  }
+  .chat__activity-log {
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .chat__activity-line {
+    font-family: var(--font-mono);
     font-size: 11px;
     color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    opacity: 0.8;
+  }
+  .chat__activity-line:last-child {
+    opacity: 1;
+    color: var(--text-primary);
+  }
+  .chat__activity-details {
+    margin-top: 6px;
+    border-top: 1px solid rgba(240, 246, 252, 0.05);
+    padding-top: 6px;
+  }
+  .chat__activity-details summary {
+    font-size: 10px;
+    color: var(--text-muted);
     cursor: pointer;
     user-select: none;
-    list-style: none;
-    display: flex;
-    align-items: center;
-    gap: 6px;
+    outline: none;
   }
-  .chat__thoughts-toggle::-webkit-details-marker { display: none; }
-  .chat__thoughts-toggle::before {
-    content: "▶";
-    font-size: 8px;
-    transition: transform 0.15s ease;
-  }
-  details[open] > .chat__thoughts-toggle::before {
-    transform: rotate(90deg);
-  }
-  .chat__thoughts-body {
-    padding: 6px 10px 8px;
-    max-height: 200px;
+  .chat__activity-details summary:hover { color: var(--text-secondary); }
+  .chat__activity-full {
+    margin-top: 8px;
+    max-height: 150px;
     overflow-y: auto;
-    border-top: 1px solid rgba(139, 148, 158, 0.1);
-  }
-  .chat__thought-line {
-    font-family: var(--font-mono, 'Consolas', 'Monaco', monospace);
-    font-size: 11px;
-    line-height: 1.6;
-    color: var(--text-secondary);
-    padding: 1px 0;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .chat__thought-line:nth-child(odd) {
-    color: rgba(139, 148, 158, 0.8);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
   }
 
   /* ── Loading dots ── */

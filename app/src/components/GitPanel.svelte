@@ -1,8 +1,8 @@
 <script>
   import { onMount } from "svelte";
-  import { gitStatus, gitStage, gitCommit, getBranches, checkoutBranch, gitStash, gitStashPop, gitDiscard } from "../lib/api";
+  import { gitStatus, gitStage, gitCommit, getBranches, checkoutBranch, gitStash, gitStashPop, gitDiscard } from "../lib/api.js";
 
-  let { workspacePath = "" } = $props();
+  let { workspacePath = "", onfileselect } = $props();
 
   let changes = $state([]);
   let commitMessage = $state("");
@@ -141,7 +141,14 @@
           <span class="status-badge" class:modified={change.status.includes('M')} class:added={change.status.includes('?') || change.status.includes('A')}>
             {change.status.trim() || 'M'}
           </span>
-          <span class="file-path" title={change.path}>{change.path.split('/').pop()}</span>
+          <span 
+            class="file-path" 
+            title={change.path} 
+            onclick={() => onfileselect?.({ detail: { path: workspacePath + '/' + change.path } })}
+            style="cursor: pointer"
+          >
+            {change.path.split(/[/\\]/).pop()}
+          </span>
           <div class="change-actions">
             <button class="action-item-btn discard" onclick={() => handleDiscard(change.path)} title="Discard Changes">↩</button>
             <button class="action-item-btn stage" onclick={() => handleStage(change.path)} title="Stage Change">+</button>

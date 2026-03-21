@@ -115,9 +115,25 @@ class GitTool:
             return {"current": None, "branches": []}
 
     def checkout_branch(self, branch_name: str) -> str:
-        """Checks out a specific branch."""
-        self._run_git(["checkout", branch_name])
-        return f"Switched to branch '{branch_name}'"
+        """Checks out a specific branch, handling local and remote cases."""
+        try:
+            # 1. Try simple checkout (works for local and auto-trackable remotes)
+            self._run_git(["checkout", branch_name])
+            return f"Switched to branch '{branch_name}'"
+        except Exception as e_local:
+            try:
+                # 2. If it's a remote branch we saw via ls-remote, try tracking it
+                # We fetch first to ensure origin/<branch> exists in local refs
+                self._run_git(["fetch", "origin", branch_name])
+                self._run_git(["checkout", "-b", branch_name, f"origin/{branch_name}"])
+                return f"Switched to and tracking remote branch 'origin/{branch_name}'"
+            except Exception as e_remote:
+                # 3. Fallback: maybe it's already there but just needs a forced switch
+                try:
+                   self._run_git(["checkout", "-B", branch_name, f"origin/{branch_name}"])
+                   return f"Reset to remote branch 'origin/{branch_name}'"
+                except:
+                   raise Exception(f"Branch switch failed. Local error: {e_local}. Remote error: {e_remote}")
     def stash_changes(self) -> str:
         """Stashes local changes."""
         self._run_git(["stash"])
@@ -129,5 +145,17 @@ class GitTool:
         return "Stash popped successfully"
     def discard_changes(self, file_path: str) -> str:
         """Discards local changes to a specific file."""
-        self._run_git(["checkout", "--", file_path])
-        return f"Discarded changes for {file_path}"
+        # Check status to see if it's untracked
+        status = self.get_status()
+        is_untracked = any(c['path'] == file_path and c['status'].strip() == '??' for c in status)
+        
+        if is_untracked:
+            # For untracked files, discard means delete
+            full_path = os.path.join(self.root_path, file_path)
+            if os.path.exists(full_path):
+                os.remove(full_path)
+            return f"Deleted untracked file {file_path}"
+        else:
+            # For tracked files, use checkout
+            self._run_git(["checkout", "--", file_path])
+            return f"Discarded changes for {file_path}"

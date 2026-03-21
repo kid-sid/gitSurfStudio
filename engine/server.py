@@ -39,6 +39,7 @@ from src.tools.web_tool import WebSearchTool
 from src.tools.repo_manager import RepoManager
 from src.tools.git_tool import GitTool
 from src.tools.editor_ui_tool import EditorUITool
+from src.tools.symbol_extractor import SymbolExtractor
 from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, PipelineContext
 
 app = FastAPI(
@@ -66,6 +67,9 @@ class EngineState:
         self.github_token: Optional[str] = None
         self.repo_manager = RepoManager(
             cache_dir=os.path.join(os.path.dirname(__file__), ".cache")
+        )
+        self.symbol_extractor = SymbolExtractor(
+            cache_dir=os.path.join(os.path.dirname(__file__), ".cache", "symbols")
         )
 
     def get_active_token(self) -> Optional[str]:
@@ -229,6 +233,47 @@ async def init_workspace(req: InitRequest):
         "has_project_context": bool(state.project_context),
         "is_github": "github.com" in req.input.lower(),
     }
+
+@app.get("/symbols")
+async def get_symbols(path: str, workspace: Optional[str] = None):
+    """
+    Extracts symbols (classes, functions) from a file or directory.
+    If 'workspace' is provided, 'path' is treated as relative to it.
+    """
+    target_path = path
+    if workspace:
+        target_path = os.path.join(workspace, path)
+    
+    target_path = os.path.abspath(target_path)
+    if not os.path.exists(target_path):
+        raise HTTPException(status_code=404, detail="Path not found")
+
+    try:
+        if os.path.isfile(target_path):
+            # Extract from single file
+            ext = os.path.splitext(target_path)[1].lower()
+            if ext in state.symbol_extractor.PYTHON_EXTENSIONS:
+                symbols = state.symbol_extractor._extract_python(target_path)
+            elif ext in state.symbol_extractor.JS_EXTENSIONS:
+                symbols = state.symbol_extractor._extract_js(target_path)
+            elif ext in state.symbol_extractor.C_FAMILY_EXTENSIONS:
+                symbols = state.symbol_extractor._extract_c_family(target_path)
+            else:
+                symbols = []
+            return {"path": path, "symbols": symbols}
+        else:
+            # Extract from directory (cached or rebuild)
+            raw_symbols = state.symbol_extractor.extract_from_directory(target_path)
+            # Flatten dict into a list
+            symbols = []
+            for file_path, file_symbols in raw_symbols.items():
+                for sym in file_symbols:
+                    sym_with_file = dict(sym)
+                    sym_with_file["file"] = file_path # Keep as relative path from extraction root
+                    symbols.append(sym_with_file)
+            return {"path": path, "symbols": symbols}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/git/status")
 async def git_status(path: str):

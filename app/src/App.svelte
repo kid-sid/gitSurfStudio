@@ -7,7 +7,8 @@
   import StatusBar from "./components/StatusBar.svelte";
 import ForkButton from "./components/ForkButton.svelte";
 import GitPanel from "./components/GitPanel.svelte";
-  import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./lib/api.js";
+import SymbolBrowser from "./components/SymbolBrowser.svelte";
+import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./lib/api.js";
 
   let activeFile = $state("");
   let openFiles = $state([]);
@@ -19,6 +20,13 @@ import GitPanel from "./components/GitPanel.svelte";
   let isGitHubRepo = $state(false);
   let isAuthenticated = $state(false);
   let activeSidebarView = $state("explorer"); // "explorer" or "git"
+
+  // Ensure activeFile is always in openFiles
+  $effect(() => {
+    if (activeFile && !openFiles.includes(activeFile)) {
+      openFiles = [...openFiles, activeFile];
+    }
+  });
 
   onMount(async () => {
     // Initial health and auth check
@@ -155,13 +163,21 @@ import GitPanel from "./components/GitPanel.svelte";
           onclick={() => activeSidebarView = 'git'}
           title="Source Control"
         >🌿</button>
+        <button 
+          class="activity-btn" 
+          class:active={activeSidebarView === 'symbols'} 
+          onclick={() => activeSidebarView = 'symbols'}
+          title="Symbol Browser"
+        >🧩</button>
       </nav>
 
       <aside class="sidebar">
         {#if activeSidebarView === 'explorer'}
           <FileTree {workspacePath} onfileselect={handleFileSelect} onworkspaceopen={handleWorkspaceOpen} />
         {:else if activeSidebarView === 'git'}
-          <GitPanel {workspacePath} />
+          <GitPanel {workspacePath} onfileselect={handleFileSelect} />
+        {:else if activeSidebarView === 'symbols'}
+          <SymbolBrowser {workspacePath} bind:activeFile={activeFile} />
         {/if}
       </aside>
 
@@ -174,7 +190,11 @@ import GitPanel from "./components/GitPanel.svelte";
       </main>
 
       <aside class="chat-panel">
-        <ChatPanel {workspacePath} bind:engineOnline oncommand={handleUICommand} />
+        <ChatPanel 
+          {workspacePath} 
+          bind:engineOnline 
+          oncommand={handleUICommand} 
+        />
       </aside>
     </div>
   {/if}
