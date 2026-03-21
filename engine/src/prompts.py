@@ -174,7 +174,7 @@ Your queries will be executed directly against the codebase to retrieve relevant
 </user_request>
 
 TASK:
-Generate 5–10 ripgrep search queries that maximally cover the code likely relevant to the user's request.
+Generate 5-10 ripgrep search queries that maximally cover the code likely relevant to the user's request.
 Return ONLY the queries — one per line, no numbering, no markdown, no explanation.
 
 QUERY CONSTRUCTION RULES:
