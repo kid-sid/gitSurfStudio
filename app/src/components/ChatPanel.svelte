@@ -2,12 +2,14 @@
   import { onMount } from "svelte";
   import { sendChat, checkHealth } from "../lib/api.js";
 
-  let { workspacePath = "", engineOnline = $bindable(false) } = $props();
+  let { workspacePath = "", engineOnline = $bindable(false), oncommand = null } = $props();
 
   let messages = $state([]);
   let inputText = $state("");
   let isLoading = $state(false);
+  let statusText = $state("Thinking...");
   let chatContainer;
+  let abortController = null;
 
   onMount(() => {
     pingEngine();
@@ -26,7 +28,15 @@
     inputText = "";
     messages.push({ role: "user", content: query });
     isLoading = true;
+    statusText = "🚀 Starting...";
+
+    // Push a skeleton assistant message that will be filled in progressively
+    const assistantMsg = { role: "assistant", content: "", thoughts: [], thinking: true, stepCount: 0 };
+    messages.push(assistantMsg);
+    const msgIndex = messages.length - 1;
     setTimeout(scrollToBottom, 50);
+
+    abortController = new AbortController();
 
     try {
       let answer = "";
@@ -34,19 +44,57 @@
         query,
         workspacePath || ".",
         [],
-        null,
-        (answerContent) => { answer = answerContent; }
+        (logLine) => {
+          // Push log to thoughts array
+          messages[msgIndex].thoughts = [...messages[msgIndex].thoughts, logLine];
+
+          // Increment step count
+          if (logLine.includes("[Step")) {
+            messages[msgIndex].stepCount++;
+          }
+
+          // Update concise status
+          if (logLine.includes("[Step"))
+            statusText = `Step ${messages[msgIndex].stepCount}: ` + logLine.split("] ").pop();
+          else if (logLine.includes("Refined to:"))
+            statusText = "🔍 " + logLine.trim();
+          else if (logLine.includes("[Embeddings]") || logLine.includes("Encoding"))
+            statusText = "🧮 Computing embeddings...";
+          else if (logLine.includes("[Action Loop]") || logLine.includes("Iteration"))
+            statusText = "🧠 Reasoning...";
+          else if (logLine.includes("[Fast-Path]"))
+            statusText = "⚡ Fast-Path executing...";
+          else if (logLine.includes("[Smart-Route]"))
+            statusText = "✅ Context ready, generating answer...";
+
+          setTimeout(scrollToBottom, 50);
+        },
+        (answerContent) => { answer = answerContent; },
+        oncommand,
+        abortController.signal
       );
-      messages.push({ role: "assistant", content: answer });
+      messages[msgIndex].content = answer;
     } catch (error) {
-      messages.push({
-        role: "error",
-        content: `Failed to reach the engine.\n\nStart it with:\ncd engine && uvicorn server:app --port 8000\n\nError: ${error.message}`
-      });
+      if (error.name === "AbortError") {
+        messages[msgIndex].content = "_Stopped by user._";
+      } else {
+        messages[msgIndex] = {
+          role: "error",
+          content: `Failed to reach the engine.\n\nStart it with:\ncd engine && uvicorn server:app --port 8002\n\nError: ${error.message}`,
+        };
+      }
     }
 
+    messages[msgIndex].thinking = false;
     isLoading = false;
+    abortController = null;
     setTimeout(scrollToBottom, 50);
+  }
+
+  function handleStop() {
+    if (abortController) {
+      abortController.abort();
+    }
   }
 
   function scrollToBottom() {
@@ -104,18 +152,55 @@
             {msg.role === "user" ? "You" : msg.role === "assistant" ? "GitSurf" : "Error"}
           </span>
         </div>
-        <div class="chat__msg-body">{msg.content}</div>
+
+        <!-- Enhanced Activity Feed & Reasoning -->
+        {#if msg.thoughts && msg.thoughts.length > 0}
+          <div class="chat__activity" class:chat__activity--thinking={msg.thinking}>
+            <div class="chat__activity-header">
+              <span class="chat__activity-title">
+                {msg.thinking ? "⚙️ Processing..." : "✅ Completed"}
+              </span>
+              {#if msg.stepCount > 0}
+                <span class="chat__activity-steps">
+                  {msg.stepCount} {msg.stepCount === 1 ? 'step' : 'steps'}
+                </span>
+              {/if}
+            </div>
+            
+            <div class="chat__activity-log">
+              {#each msg.thoughts.slice(-3) as thought}
+                <div class="chat__activity-line">{thought}</div>
+              {/each}
+              {#if msg.thoughts.length > 3}
+                <details class="chat__activity-details">
+                  <summary>View full log ({msg.thoughts.length} lines)</summary>
+                  <div class="chat__activity-full">
+                    {#each msg.thoughts as thought}
+                      <div class="chat__activity-line">{thought}</div>
+                    {/each}
+                  </div>
+                </details>
+              {/if}
+            </div>
+          </div>
+        {/if}
+
+        <!-- Loading indicator (only while still thinking and no answer yet) -->
+        {#if msg.thinking && !msg.content}
+          <div class="chat__loading">
+            <div class="chat__loading-dots">
+              <span></span><span></span><span></span>
+            </div>
+            <span>{statusText}</span>
+          </div>
+        {/if}
+
+        <!-- Message body (answer) -->
+        {#if msg.content}
+          <div class="chat__msg-body">{msg.content}</div>
+        {/if}
       </div>
     {/each}
-
-    {#if isLoading}
-      <div class="chat__loading">
-        <div class="chat__loading-dots">
-          <span></span><span></span><span></span>
-        </div>
-        <span>Thinking...</span>
-      </div>
-    {/if}
   </div>
 
   <div class="chat__input-area">
@@ -127,9 +212,15 @@
       rows="2"
       disabled={isLoading}
     ></textarea>
-    <button class="chat__send" onclick={handleSend} disabled={isLoading || !inputText.trim()}>
-      ➤
-    </button>
+    {#if isLoading}
+      <button class="chat__stop" onclick={handleStop} title="Stop generation">
+        ■
+      </button>
+    {:else}
+      <button class="chat__send" onclick={handleSend} disabled={!inputText.trim()}>
+        ➤
+      </button>
+    {/if}
   </div>
 </div>
 
@@ -190,6 +281,82 @@
     color: var(--accent-red);
   }
 
+  /* ── Activity Feed (Enhanced Reasoning) ── */
+  .chat__activity {
+    margin: 4px 0 8px;
+    background: rgba(48, 54, 61, 0.4);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    transition: all 0.3s ease;
+  }
+  .chat__activity--thinking {
+    border-color: rgba(56, 139, 253, 0.4);
+    background: rgba(56, 139, 253, 0.05);
+  }
+  .chat__activity-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 10px;
+    background: rgba(48, 54, 61, 0.2);
+    border-bottom: 1px solid rgba(240, 246, 252, 0.05);
+  }
+  .chat__activity-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .chat__activity-steps {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: rgba(56, 139, 253, 0.15);
+    color: var(--text-accent);
+    border-radius: 10px;
+  }
+  .chat__activity-log {
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .chat__activity-line {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    opacity: 0.8;
+  }
+  .chat__activity-line:last-child {
+    opacity: 1;
+    color: var(--text-primary);
+  }
+  .chat__activity-details {
+    margin-top: 6px;
+    border-top: 1px solid rgba(240, 246, 252, 0.05);
+    padding-top: 6px;
+  }
+  .chat__activity-details summary {
+    font-size: 10px;
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+    outline: none;
+  }
+  .chat__activity-details summary:hover { color: var(--text-secondary); }
+  .chat__activity-full {
+    margin-top: 8px;
+    max-height: 150px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  /* ── Loading dots ── */
   .chat__loading {
     display: flex; align-items: center; gap: 8px; padding: 8px 12px;
     color: var(--text-secondary); font-size: 12px;
@@ -206,6 +373,7 @@
     40% { opacity: 1; transform: scale(1.2); }
   }
 
+  /* ── Input area ── */
   .chat__input-area {
     display: flex; gap: 8px; padding: 12px;
     border-top: 1px solid var(--border); background: var(--bg-secondary);
@@ -225,4 +393,19 @@
   }
   .chat__send:hover:not(:disabled) { background: #79b8ff; }
   .chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ── Stop button ── */
+  .chat__stop {
+    width: 36px; height: 36px; align-self: flex-end;
+    border-radius: var(--radius-md); background: var(--accent-red, #f85149);
+    color: white; font-size: 14px; font-weight: bold;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; border: none;
+    animation: pulse-red 1.5s infinite ease-in-out;
+  }
+  .chat__stop:hover { background: #da3633; }
+  @keyframes pulse-red {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(248, 81, 73, 0.4); }
+    50% { box-shadow: 0 0 0 6px rgba(248, 81, 73, 0); }
+  }
 </style>

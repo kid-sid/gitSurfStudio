@@ -29,6 +29,10 @@ class PipelineContext:
         self.search_path = os.path.abspath(search_path)
         self.rebuild_index = rebuild_index
 
+        # Resolve cache dirs relative to the engine directory, not CWD
+        _engine_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._cache_base = os.path.join(_engine_dir, ".cache")
+
         # Lazily initialized tools (populated on first search query)
         self._emb_client = None
         self._vector_tool = None
@@ -52,26 +56,26 @@ class PipelineContext:
         if self._vector_tool is None:
             self._vector_tool = VectorSearchTool(
                 embedding_client=self.emb_client,
-                cache_dir=os.path.join(".cache", "vector_index"),
+                cache_dir=os.path.join(self._cache_base, "vector_index"),
             )
         return self._vector_tool
 
     @property
     def bm25_tool(self):
         if self._bm25_tool is None:
-            self._bm25_tool = BM25SearchTool(cache_dir=os.path.join(".cache", "bm25_index"))
+            self._bm25_tool = BM25SearchTool(cache_dir=os.path.join(self._cache_base, "bm25_index"))
         return self._bm25_tool
 
     @property
     def sym_extractor(self):
         if self._sym_extractor is None:
-            self._sym_extractor = SymbolExtractor(cache_dir=os.path.join(".cache", "symbols"))
+            self._sym_extractor = SymbolExtractor(cache_dir=os.path.join(self._cache_base, "symbols"))
         return self._sym_extractor
 
     @property
     def call_graph(self):
         if self._call_graph is None:
-            self._call_graph = CallGraph(cache_dir=os.path.join(".cache", "call_graph"))
+            self._call_graph = CallGraph(cache_dir=os.path.join(self._cache_base, "call_graph"))
         return self._call_graph
 
     @property
@@ -141,6 +145,8 @@ def execute_action_loop(
             project_structure=project_structure,
             history=history,
             available_tools=available_tools,
+            current_iteration=iteration,
+            max_iterations=max_iterations,
         )
 
         action_type = decision.get("action")
@@ -242,10 +248,26 @@ def run_code_aware_pipeline(
     technical_intent = refined_data.get("intent", "General search")
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
-
+    direct_tool_call = refined_data.get("direct_tool_call")
     print(f"   Intent: {technical_intent}")
-    if query_to_use != question:
-        print(f"   Refined Question: {query_to_use}")
+    print(f"   Refined to: \"{query_to_use}\"")
+    print(f"   Keywords: {expansion_keywords[:5]}")
+
+    if direct_tool_call:
+        print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")
+        tool_name = direct_tool_call.get("tool")
+        method = direct_tool_call.get("method")
+        args = direct_tool_call.get("args", {})
+        tool_instance = tools.get(tool_name)
+        if tool_instance:
+            fn = getattr(tool_instance, method, None)
+            if fn:
+                try:
+                    observation = fn(**args)
+                    return f"Action taken: {tool_name}.{method}({args})\nObservation: {observation}", ""
+                except Exception as e:
+                    return f"[Error] Fast-Path failed: {e}", ""
+        print("   [Fast-Path] Tool or method not found, falling back to full pipeline.")
 
     top_chunks: List[Dict] = []
     call_graph_context = ""
@@ -488,6 +510,25 @@ def run_local_pipeline(
     query_to_use = refined_data.get("refined_question", question)
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
+    direct_tool_call = refined_data.get("direct_tool_call")
+    print(f"   Refined to: \"{query_to_use}\"")
+    print(f"   Keywords: {expansion_keywords[:5]}")
+
+    if direct_tool_call:
+        print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")
+        tool_name = direct_tool_call.get("tool")
+        method = direct_tool_call.get("method")
+        args = direct_tool_call.get("args", {})
+        tool_instance = tools.get(tool_name)
+        if tool_instance:
+            fn = getattr(tool_instance, method, None)
+            if fn:
+                try:
+                    observation = fn(**args)
+                    return f"Action taken: {tool_name}.{method}({args})\nObservation: {observation}", ""
+                except Exception as e:
+                    return f"[Error] Fast-Path failed: {e}", ""
+        print("   [Fast-Path] Tool or method not found, falling back to full pipeline.")
 
     top_chunks: List[Dict] = []
 

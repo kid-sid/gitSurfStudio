@@ -1,0 +1,17 @@
+# Dependencies (installed fresh inside the image)
+node_modules/
+
+# Build output (produced inside the image)
+dist/
+
+# Tauri (native desktop — not needed for Docker web build)
+src-tauri/
+
+# Git history
+.git/
+
+# OS / IDE
+.DS_Store
+*.log
+.vscode/
+.idea/
