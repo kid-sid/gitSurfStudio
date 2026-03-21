@@ -9,3 +9,5 @@ rank_bm25
 beautifulsoup4
 fastapi
 uvicorn
+pydantic
+pydantic-settings

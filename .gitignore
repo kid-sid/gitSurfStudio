@@ -1,5 +1,8 @@
 # --- GitSurf Studio Monorepo GitIgnore ---
 
+# --- IDE ---
+.vscode/
+
 # --- Python / Engine ---
 __pycache__/
 *.py[cod]
