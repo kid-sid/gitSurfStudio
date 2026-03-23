@@ -1,0 +1,32 @@
+# Ruff — Python linter + formatter for engine/
+# https://docs.astral.sh/ruff/
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes (undefined names, unused imports, etc.)
+    "I",   # isort (import order)
+    "B",   # flake8-bugbear (common bugs)
+    "UP",  # pyupgrade (modernise Python syntax)
+    "C4",  # flake8-comprehensions (unnecessary list comprehensions)
+    "SIM", # flake8-simplify (simplifiable code)
+]
+ignore = [
+    "E501",  # line-too-long (handled by formatter)
+    "B008",  # do not perform function calls in default args (common in FastAPI)
+    "SIM117",# merge nested with-statements (readability preference)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files can use magic values and assert statements freely
+"run_tests.py" = ["S101", "PLR2004"]
+"generate_report.py" = ["T201"]  # allow print()
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

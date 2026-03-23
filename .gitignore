@@ -1,5 +1,8 @@
 # --- GitSurf Studio Monorepo GitIgnore ---
 
+# --- IDE ---
+.vscode/
+
 # --- Python / Engine ---
 __pycache__/
 *.py[cod]
@@ -11,6 +14,9 @@ engine/.env
 engine/.gitsurf_history.json
 engine/faiss_index/
 engine/symbol_minimap.json
+
+# --- Secrets (root .env must NEVER be committed) ---
+/.env
 
 # --- Node / Svelte Frontend ---
 app/node_modules/
@@ -29,6 +35,7 @@ implementation_plan*.md
 walkthrough.md
 task.md
 codebase_review.md
+future_implementation.md
 
 # --- OS / IDE ---
 .idea/
@@ -36,3 +43,6 @@ codebase_review.md
 *.swp
 *.swo
 Thumbs.db
+
+# --- Tests ---
+test*

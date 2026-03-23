@@ -12,15 +12,19 @@ import os
 import sys
 import json
 import asyncio
+import requests
 from typing import Optional, List, Dict
 from contextlib import redirect_stdout
-from io import StringIO
+import queue
 from dotenv import load_dotenv
-load_dotenv()
 
-from fastapi import FastAPI, HTTPException
+# Try to load .env from current directory, then from parent (project root)
+if not load_dotenv():
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 from pydantic import BaseModel
 
 # Ensure engine modules are importable
@@ -33,6 +37,9 @@ from src.tools.file_editor_tool import FileEditorTool
 from src.tools.search_tool import SearchTool
 from src.tools.web_tool import WebSearchTool
 from src.tools.repo_manager import RepoManager
+from src.tools.git_tool import GitTool
+from src.tools.editor_ui_tool import EditorUITool
+from src.tools.symbol_extractor import SymbolExtractor
 from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, PipelineContext
 
 app = FastAPI(
@@ -49,14 +56,24 @@ app.add_middleware(
 )
 
 class EngineState:
-    """Holds initialized components across requests (zero cold-start)."""
     def __init__(self):
         self.llm: Optional[LLMClient] = None
         self.history: Optional[HistoryManager] = None
         self.pipeline_ctx: Optional[PipelineContext] = None
         self.agent_tools: Dict = {}
         self.workspace_path: Optional[str] = None
-        self.repo_manager = RepoManager(cache_dir=os.path.join(os.path.dirname(__file__), ".cache"))
+        self.project_context: str = ""
+        self.git_tool: Optional[GitTool] = None
+        self.github_token: Optional[str] = None
+        self.repo_manager = RepoManager(
+            cache_dir=os.path.join(os.path.dirname(__file__), ".cache")
+        )
+        self.symbol_extractor = SymbolExtractor(
+            cache_dir=os.path.join(os.path.dirname(__file__), ".cache", "symbols")
+        )
+
+    def get_active_token(self) -> Optional[str]:
+        return self.github_token or os.getenv("GITHUB_TOKEN")
 
 state = EngineState()
 
@@ -77,6 +94,25 @@ class AutocompleteRequest(BaseModel):
     file_path: str     # Current file being edited
     path: str          # Workspace root
 
+class WriteRequest(BaseModel):
+    path: str
+    content: str
+
+class GitStatusRequest(BaseModel):
+    path: str
+
+class GitStageRequest(BaseModel):
+    path: str
+    files: List[str]
+
+class GitCommitRequest(BaseModel):
+    path: str
+    message: str
+
+class GitForkRequest(BaseModel):
+    path: str
+    repo_name: str
+
 
 AVAILABLE_TOOLS = """
 Tool: FileEditorTool
@@ -84,8 +120,24 @@ Description: Read, write, modify, or delete files inside the project directory.
 Methods:
   - read_file(rel_path, start_line=None, end_line=None)
   - write_file(rel_path, content)
-  - replace_in_file(rel_path, target, replacement)
+  - replace_in_file(rel_path, target, replacement, allow_multiple=False)
+    NOTE: target must match exactly once unless allow_multiple=True.
+    On ambiguity, returns the line numbers of all matches to help refine the target.
   - delete_file(rel_path)
+
+Tool: EditorUITool
+Description: Control the IDE user interface.
+Methods:
+  - open_file(rel_path)
+    Opens the specified file in an editor tab.
+ 
+Tool: GitTool
+Description: Handle local Git operations (status, stage, commit, diff).
+Methods:
+  - get_status()
+  - stage_files(files)
+  - commit(message)
+  - get_diff(file_path=None)
 
 Tool: SearchTool
 Description: Search for text patterns in the codebase using ripgrep.
@@ -102,9 +154,8 @@ Methods:
 
 
 def _ensure_initialized(workspace_path: str):
-    """Initialize or re-initialize engine components for the given workspace."""
     if state.workspace_path == workspace_path and state.llm is not None:
-        return  # Already initialized for this workspace
+        return
 
     state.workspace_path = workspace_path
     state.llm = LLMClient()
@@ -112,15 +163,38 @@ def _ensure_initialized(workspace_path: str):
         history_file=os.path.join(workspace_path, ".gitsurf_history.json")
     )
 
+    # ── Wire project context ──────────────────────────────────────────
+    # Check for README variants in priority order
+    readme_candidates = ["README.md", "readme.md", "README.rst", "README.txt"]
+    state.project_context = ""
+    for candidate in readme_candidates:
+        readme_path = os.path.join(workspace_path, candidate)
+        if os.path.exists(readme_path):
+            try:
+                with open(readme_path, "r", encoding="utf-8", errors="replace") as f:
+                    readme_content = f.read()
+                print(f"[Init] Analyzing project context from {candidate}...")
+                state.project_context = state.llm.analyze_project_context(readme_content)
+                print(f"[Init] Project context ready ({len(state.project_context)} chars)")
+            except Exception as e:
+                print(f"[Init] Warning: Could not analyze README: {e}")
+            break   # stop at first found
+    # ─────────────────────────────────────────────────────────────────
+
     file_editor = FileEditorTool(root_path=workspace_path)
+    git_tool = GitTool(root_path=workspace_path)
+    editor_ui = EditorUITool(root_path=workspace_path)
     searcher = SearchTool()
     web_tool = WebSearchTool()
 
     state.agent_tools = {
         "FileEditorTool": file_editor,
+        "GitTool": git_tool,
+        "EditorUITool": editor_ui,
         "SearchTool": searcher,
         "WebSearchTool": web_tool,
     }
+    state.git_tool = git_tool
 
     state.pipeline_ctx = PipelineContext(
         search_path=workspace_path,
@@ -135,26 +209,216 @@ async def health():
 
 @app.post("/init")
 async def init_workspace(req: InitRequest):
-    """
-    Initializes a workspace from a local path or GitHub URL.
-    """
     target_path = req.input.strip()
 
-    # Detect GitHub URL
     if "github.com" in target_path:
         repo_name = target_path.split("github.com/")[-1].strip("/")
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+            
         try:
             target_path = state.repo_manager.sync_repo(repo_name)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to clone repository: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to clone: {e}")
     else:
-        # Local path validation
         target_path = os.path.abspath(target_path)
         if not os.path.exists(target_path):
             raise HTTPException(status_code=404, detail="Local path does not exist")
 
     _ensure_initialized(target_path)
-    return {"status": "success", "workspace_path": target_path}
+
+    return {
+        "status": "success",
+        "workspace_path": target_path,
+        "has_project_context": bool(state.project_context),
+        "is_github": "github.com" in req.input.lower(),
+    }
+
+@app.get("/symbols")
+async def get_symbols(path: str, workspace: Optional[str] = None):
+    """
+    Extracts symbols (classes, functions) from a file or directory.
+    If 'workspace' is provided, 'path' is treated as relative to it.
+    """
+    target_path = path
+    if workspace:
+        target_path = os.path.join(workspace, path)
+    
+    target_path = os.path.abspath(target_path)
+    if not os.path.exists(target_path):
+        raise HTTPException(status_code=404, detail="Path not found")
+
+    try:
+        if os.path.isfile(target_path):
+            # Extract from single file
+            ext = os.path.splitext(target_path)[1].lower()
+            if ext in state.symbol_extractor.PYTHON_EXTENSIONS:
+                symbols = state.symbol_extractor._extract_python(target_path)
+            elif ext in state.symbol_extractor.JS_EXTENSIONS:
+                symbols = state.symbol_extractor._extract_js(target_path)
+            elif ext in state.symbol_extractor.C_FAMILY_EXTENSIONS:
+                symbols = state.symbol_extractor._extract_c_family(target_path)
+            else:
+                symbols = []
+            return {"path": path, "symbols": symbols}
+        else:
+            # Extract from directory (cached or rebuild)
+            raw_symbols = state.symbol_extractor.extract_from_directory(target_path)
+            # Flatten dict into a list
+            symbols = []
+            for file_path, file_symbols in raw_symbols.items():
+                for sym in file_symbols:
+                    sym_with_file = dict(sym)
+                    sym_with_file["file"] = file_path # Keep as relative path from extraction root
+                    symbols.append(sym_with_file)
+            return {"path": path, "symbols": symbols}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/git/status")
+async def git_status(path: str):
+    _ensure_initialized(path)
+    if not state.git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    return {"status": state.git_tool.get_status()}
+
+@app.post("/git/stage")
+async def git_stage(req: GitStageRequest):
+    _ensure_initialized(req.path)
+    if not state.git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    result = state.git_tool.stage_files(req.files)
+    return {"message": result}
+
+@app.post("/git/commit")
+async def git_commit(req: GitCommitRequest):
+    _ensure_initialized(req.path)
+    if not state.git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    result = state.git_tool.commit(req.message)
+    return {"message": result}
+
+@app.get("/git/branch")
+async def git_branch(path: str):
+    _ensure_initialized(path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    return git_tool.get_branches()
+
+class GitCheckoutRequest(BaseModel):
+    path: str
+    branch: str
+
+@app.post("/git/checkout")
+async def git_checkout(req: GitCheckoutRequest):
+    _ensure_initialized(req.path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    try:
+        result = git_tool.checkout_branch(req.branch)
+        return {"message": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class GitStashRequest(BaseModel):
+    path: str
+
+@app.post("/git/stash")
+async def git_stash(req: GitStashRequest):
+    _ensure_initialized(req.path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    try:
+        result = git_tool.stash_changes()
+        return {"message": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class GitDiscardRequest(BaseModel):
+    path: str
+    file: str
+
+@app.post("/git/discard")
+async def git_discard(req: GitDiscardRequest):
+    _ensure_initialized(req.path)
+    git_tool = state.git_tool
+    if not git_tool:
+        raise HTTPException(status_code=400, detail="GitTool not initialized")
+    try:
+        result = git_tool.discard_changes(req.file)
+        return {"message": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/git/fork")
+async def git_fork(req: GitForkRequest):
+    _ensure_initialized(req.path)
+    github_token = state.get_active_token()
+    if not github_token:
+        raise HTTPException(status_code=401, detail="Please login with GitHub first")
+    
+    try:
+        fork_url = state.repo_manager.fork_repo(req.repo_name, github_token)
+        return {"status": "success", "fork_url": fork_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── Auth Endpoints ──────────────────────────────────────────────────
+
+@app.get("/auth/status")
+async def auth_status():
+    return {"authenticated": state.github_token is not None}
+
+@app.get("/auth/login")
+async def auth_login():
+    client_id = os.getenv("GITHUB_CLIENT_ID")
+    if not client_id:
+        raise HTTPException(status_code=500, detail="GITHUB_CLIENT_ID not set")
+    
+    scope = "repo,user"
+    github_url = f"https://github.com/login/oauth/authorize?client_id={client_id}&scope={scope}"
+    return RedirectResponse(github_url)
+
+@app.get("/auth/callback")
+async def auth_callback(code: str):
+    client_id = os.getenv("GITHUB_CLIENT_ID")
+    client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+    
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="OAuth credentials not set")
+
+    # Exchange code for token
+    token_url = "https://github.com/login/oauth/access_token"
+    headers = {"Accept": "application/json"}
+    params = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+    }
+    
+    response = requests.post(token_url, json=params, headers=headers)
+    token_data = response.json()
+    
+    if "access_token" in token_data:
+        state.github_token = token_data["access_token"]
+        return HTMLResponse("""
+            <html>
+                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; background: #0d1117; color: white;">
+                    <div style="text-align: center;">
+                        <h1>🌊 GitSurf Studio</h1>
+                        <p style="color: #63ff63;">✓ Authenticated successfully!</p>
+                        <p>You can close this tab and return to the IDE.</p>
+                        <script>setTimeout(() => window.close(), 3000);</script>
+                    </div>
+                </body>
+            </html>
+        """)
+    else:
+        error_msg = token_data.get("error_description", "Failed to exchange token")
+        raise HTTPException(status_code=400, detail=error_msg)
 
 
 @app.get("/files")
@@ -198,52 +462,126 @@ async def read_file(path: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/write")
+async def write_file(req: WriteRequest):
+    """Writes content to a file on local disk."""
+    abs_path = os.path.abspath(req.path)
+    
+    # Safety check: Ensure the path is within the workspace if one is active
+    if state.workspace_path:
+        try:
+            # commonpath is safe: /workspace/foo won't match /workspace/foobar
+            common = os.path.commonpath([abs_path, state.workspace_path])
+            if common != state.workspace_path:
+                raise HTTPException(status_code=403, detail="Path outside of workspace")
+        except ValueError:
+            # commonpath raises ValueError on Windows when paths are on different drives
+            raise HTTPException(status_code=403, detail="Path outside of workspace")
+    
+    try:
+        # Ensure parent directories exist (dirname is empty for root-level paths)
+        parent_dir = os.path.dirname(abs_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        
+        # Use FileEditorTool if it exists to preserve its logic (e.g. rel_path handling)
+        if state.workspace_path and "FileEditorTool" in state.agent_tools:
+            editor = state.agent_tools["FileEditorTool"]
+            try:
+                rel_path = os.path.relpath(abs_path, state.workspace_path)
+                res = editor.write_file(rel_path, req.content)
+                if "[Error]" in res:
+                    raise Exception(res)
+                return {"status": "success", "message": res}
+            except ValueError:
+                # Path might be absolute but outside root or just tricky relpath
+                pass
+
+        # Fallback to direct write
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(req.content)
+        return {"status": "success", "message": f"Wrote to {abs_path}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class QueueWriter:
+    """A file-like object that pushes each print() line into a thread-safe queue."""
+    def __init__(self, log_queue: queue.Queue):
+        self._queue = log_queue
+        self._buffer = ""
+
+    def write(self, text: str):
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                self._queue.put(line)
+
+    def flush(self):
+        if self._buffer.strip():
+            self._queue.put(self._buffer.strip())
+            self._buffer = ""
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    """
-    Run the full PRAR pipeline for a user query.
-    Returns a streaming response with the agent's thought process and final answer.
-    """
     _ensure_initialized(req.path)
 
     async def stream_response():
-        # Capture stdout from the pipeline (step labels, thoughts, observations)
-        captured = StringIO()
+        log_queue = queue.Queue()
+        result_holder = {}
 
         def run_pipeline():
-            with redirect_stdout(captured):
-                answer, context = run_local_pipeline(
-                    question=req.query,
-                    search_path=req.path,
-                    llm=state.llm,
-                    project_context="",
-                    available_tools=AVAILABLE_TOOLS,
-                    tools=state.agent_tools,
-                    history=req.history,
-                    ctx=state.pipeline_ctx,
-                )
-            return answer, context
+            writer = QueueWriter(log_queue)
+            try:
+                with redirect_stdout(writer):
+                    answer, context = run_local_pipeline(
+                        question=req.query,
+                        search_path=req.path,
+                        llm=state.llm,
+                        project_context=state.project_context,
+                        available_tools=AVAILABLE_TOOLS,
+                        tools=state.agent_tools,
+                        history=req.history,
+                        ctx=state.pipeline_ctx,
+                    )
+                writer.flush()
+                result_holder["answer"] = answer
+                result_holder["context"] = context
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                result_holder["answer"] = f"Pipeline error: {e}"
+                result_holder["context"] = ""
+            finally:
+                log_queue.put(None)  # Sentinel: ALWAYS signal completion
 
-        # Run the blocking pipeline in a thread to keep FastAPI async
-        loop = asyncio.get_event_loop()
-        answer, context = await loop.run_in_executor(None, run_pipeline)
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, run_pipeline)
 
-        # Stream the captured pipeline logs first
-        logs = captured.getvalue()
-        if logs:
-            yield json.dumps({"type": "log", "content": logs}) + "\n"
+        # Poll the queue and yield each log line in real-time
+        while True:
+            await asyncio.sleep(0.05)  # 50ms polling interval
+            while not log_queue.empty():
+                line = log_queue.get_nowait()
+                if line is None:
+                    # Pipeline finished — yield the final answer
+                    answer = result_holder.get("answer", "")
+                    yield json.dumps({"type": "answer", "content": answer}) + "\n"
+                    if state.history:
+                        state.history.add_interaction(req.query, answer)
+                    return
 
-        # Then stream the final answer
-        yield json.dumps({"type": "answer", "content": answer}) + "\n"
+                if line.startswith("[UI_COMMAND] "):
+                    parts = line.replace("[UI_COMMAND] ", "").split(" ", 1)
+                    cmd = parts[0]
+                    args = parts[1] if len(parts) > 1 else ""
+                    yield json.dumps({"type": "ui_command", "command": cmd, "args": args}) + "\n"
+                else:
+                    yield json.dumps({"type": "log", "content": line}) + "\n"
 
-        # Save to history
-        if state.history:
-            state.history.add_interaction(req.query, answer)
-
-    return StreamingResponse(
-        stream_response(),
-        media_type="application/x-ndjson",
-    )
+    return StreamingResponse(stream_response(), media_type="application/x-ndjson")
 
 
 @app.post("/index")
@@ -262,10 +600,6 @@ async def reindex(req: IndexRequest):
 
 @app.post("/autocomplete")
 async def autocomplete(req: AutocompleteRequest):
-    """
-    Fast inline code completion. Skips the heavy PRAR pipeline
-    and hits the LLM directly with the code context.
-    """
     _ensure_initialized(req.path)
 
     if not state.llm or not state.llm.client:
@@ -284,17 +618,17 @@ Complete the code:"""
 
     try:
         response = state.llm.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=state.llm.fast_model,   # was hardcoded "gpt-4o-mini"
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.2,
         )
         completion = response.choices[0].message.content.strip()
-        # Strip markdown code fences if present
         if completion.startswith("```"):
             lines = completion.split("\n")
-            completion = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-
+            completion = "\n".join(
+                lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+            )
         return {"completion": completion}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Autocomplete failed: {e}")
@@ -302,4 +636,4 @@ Complete the code:"""
 # entry point
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8002)

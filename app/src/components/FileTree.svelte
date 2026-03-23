@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { getFileTree } from "../lib/api.js";
 
   let { workspacePath = "", onfileselect, onworkspaceopen } = $props();
@@ -13,6 +13,20 @@
     if (workspacePath) {
       loadFiles();
     }
+  });
+
+  onMount(() => {
+    const handleBranchChange = () => {
+      if (workspacePath) {
+        console.log("Branch changed, reloading file tree...");
+        loadFiles();
+      }
+    };
+    window.addEventListener('branch-changed', handleBranchChange);
+    
+    return () => {
+      window.removeEventListener('branch-changed', handleBranchChange);
+    };
   });
 
   async function loadFiles() {

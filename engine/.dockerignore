@@ -1,0 +1,34 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.bak
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Runtime cache (FAISS, BM25, etc. — rebuilt at startup if missing)
+.cache/
+
+# Git history
+.git/
+
+# Secrets (injected via docker-compose env_file)
+.env
+
+# Dev history files
+*.json
+!requirements.txt
+
+# Logs
+*.log
+server_log.txt
+
+# Test artefacts
+tests/
+run_tests.py
+generate_report.py
+build_index_local.py

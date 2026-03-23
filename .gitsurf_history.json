@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "Explain how the symbols are extracted in this project"
+  },
+  {
+    "role": "assistant",
+    "content": "In this project, symbols are extracted using the `SymbolExtractor` class, which can parse files to identify structured symbols like classes, functions, methods, and imports. For Python files, it uses the `ast` module to achieve high accuracy. For JavaScript/TypeScript files, it employs regex patterns to identify classes and functions, though this method is less accurate than the Python AST parsing. For C-family languages, including languages like Java, Go, and Rust, regex is also used to extract classes and functions. The extraction process involves traversing directories, ignoring certain system and cache directories, and parsing supported file types for their symbolic structure."
+  }
+]
