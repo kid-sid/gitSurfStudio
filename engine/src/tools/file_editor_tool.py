@@ -113,7 +113,7 @@ class FileEditorTool:
             if backup_result:
                 print(f"   [FileEditor] Backup created: {backup_result}")
 
-            new_content = original_content.replace(target, replacement, 1)
+            new_content = original_content.replace(target, replacement) if allow_multiple else original_content.replace(target, replacement, 1)
 
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_content)

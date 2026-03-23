@@ -1,6 +1,6 @@
 import os
 import re
-import pickle
+import joblib
 from typing import List, Dict, Optional
 from rank_bm25 import BM25Okapi
 
@@ -10,8 +10,8 @@ class BM25SearchTool:
     Treats code chunks as documents and ranks them based on term frequency
     and inverse document frequency.
     """
-    
-    CACHE_FILENAME = "bm25_index.pkl"
+
+    CACHE_FILENAME = "bm25_index.joblib"
 
     def __init__(self, cache_dir: str = ".cache/bm25_index"):
         self.cache_dir = os.path.abspath(cache_dir)
@@ -35,10 +35,9 @@ class BM25SearchTool:
 
         if not force_rebuild and os.path.exists(cache_path):
             try:
-                with open(cache_path, "rb") as f:
-                    data = pickle.load(f)
-                    self.bm25 = data["bm25"]
-                    self.metadata = data["metadata"]
+                data = joblib.load(cache_path)
+                self.bm25 = data["bm25"]
+                self.metadata = data["metadata"]
                 print(f"[BM25] Loaded cached index ({len(self.metadata)} documents)")
                 return
             except Exception as e:
@@ -56,8 +55,7 @@ class BM25SearchTool:
         self.bm25 = BM25Okapi(tokenized_corpus)
 
         try:
-            with open(cache_path, "wb") as f:
-                pickle.dump({"bm25": self.bm25, "metadata": self.metadata}, f)
+            joblib.dump({"bm25": self.bm25, "metadata": self.metadata}, cache_path)
             print(f"[BM25] Index cached to: {self.cache_dir}")
         except Exception as e:
             print(f"[BM25] Failed to cache index: {e}")

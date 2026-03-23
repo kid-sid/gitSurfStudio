@@ -74,6 +74,9 @@ export async function checkHealth() {
   }
 }
 
+/** Max time to wait for a chat response (5 minutes) */
+const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
+
 /**
  * Sends a chat query to the engine and streams the response
  * @param {string} query - User question
@@ -85,11 +88,15 @@ export async function checkHealth() {
  * @param {AbortSignal} signal - Optional AbortSignal to cancel the request
  */
 export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal) {
+  // Always enforce a 5-minute timeout; combine with caller's abort signal when provided
+  const timeoutSignal = AbortSignal.timeout(CHAT_TIMEOUT_MS);
+  const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
   const response = await fetch(`${ENGINE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query, path, history }),
-    signal,
+    signal: combinedSignal,
   });
 
   if (!response.ok) {

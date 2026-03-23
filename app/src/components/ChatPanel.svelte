@@ -4,10 +4,17 @@
 
   let { workspacePath = "", engineOnline = $bindable(false), oncommand = null } = $props();
 
-  let messages = $state([]);
+  const VISIBLE_LIMIT = 50; // max messages rendered in DOM at once
+
+  let messages = $state([]);          // full history (unbounded)
+  let visibleCount = $state(VISIBLE_LIMIT);
+  let visibleMessages = $derived(messages.slice(-visibleCount));
+  let hasHidden = $derived(messages.length > visibleCount);
+
   let inputText = $state("");
   let isLoading = $state(false);
   let statusText = $state("Thinking...");
+  let lastQuery = $state("");         // for timeout retry
   let chatContainer;
   let abortController = null;
 
@@ -21,11 +28,12 @@
     engineOnline = await checkHealth();
   }
 
-  async function handleSend() {
-    const query = inputText.trim();
+  async function handleSend(overrideQuery) {
+    const query = (overrideQuery ?? inputText).trim();
     if (!query || isLoading) return;
 
     inputText = "";
+    lastQuery = query;
     messages.push({ role: "user", content: query });
     isLoading = true;
     statusText = "🚀 Starting...";
@@ -34,16 +42,25 @@
     const assistantMsg = { role: "assistant", content: "", thoughts: [], thinking: true, stepCount: 0 };
     messages.push(assistantMsg);
     const msgIndex = messages.length - 1;
+    // Snap visible window to the latest messages
+    visibleCount = Math.max(VISIBLE_LIMIT, messages.length);
     setTimeout(scrollToBottom, 50);
 
     abortController = new AbortController();
+
+    // Build history from recent messages (exclude skeleton assistant msg just pushed)
+    const history = messages
+      .slice(0, -1)
+      .filter(m => m.role === "user" || m.role === "assistant")
+      .slice(-10)
+      .map(m => ({ role: m.role, content: m.content }));
 
     try {
       let answer = "";
       await sendChat(
         query,
         workspacePath || ".",
-        [],
+        history,
         (logLine) => {
           // Push log to thoughts array
           messages[msgIndex].thoughts = [...messages[msgIndex].thoughts, logLine];
@@ -77,6 +94,12 @@
     } catch (error) {
       if (error.name === "AbortError") {
         messages[msgIndex].content = "_Stopped by user._";
+      } else if (error.name === "TimeoutError") {
+        messages[msgIndex] = {
+          role: "error",
+          content: `_Request timed out after 5 minutes._`,
+          timedOut: true,
+        };
       } else {
         messages[msgIndex] = {
           role: "error",
@@ -110,6 +133,11 @@
 
   function clearChat() {
     messages = [];
+    visibleCount = VISIBLE_LIMIT;
+  }
+
+  function loadEarlier() {
+    visibleCount = Math.min(visibleCount + VISIBLE_LIMIT, messages.length);
   }
 </script>
 
@@ -129,20 +157,26 @@
         <h3>GitSurf AI</h3>
         <p>Ask anything about your codebase. The PRAR engine will search, reason, and answer.</p>
         <div class="chat__suggestions">
-          <button class="chat__suggestion" onclick={() => { inputText = "What does this project do?"; handleSend(); }}>
+          <button class="chat__suggestion" onclick={() => handleSend("What does this project do?")}>
             What does this project do?
           </button>
-          <button class="chat__suggestion" onclick={() => { inputText = "Explain the main architecture"; handleSend(); }}>
+          <button class="chat__suggestion" onclick={() => handleSend("Explain the main architecture")}>
             Explain the main architecture
           </button>
-          <button class="chat__suggestion" onclick={() => { inputText = "Find potential bugs"; handleSend(); }}>
+          <button class="chat__suggestion" onclick={() => handleSend("Find potential bugs")}>
             Find potential bugs
           </button>
         </div>
       </div>
     {/if}
 
-    {#each messages as msg}
+    {#if hasHidden}
+      <button class="chat__load-earlier" onclick={loadEarlier}>
+        ↑ Load earlier messages ({messages.length - visibleCount} hidden)
+      </button>
+    {/if}
+
+    {#each visibleMessages as msg}
       <div class="chat__msg chat__msg--{msg.role}">
         <div class="chat__msg-header">
           <span class="chat__msg-avatar">
@@ -198,6 +232,9 @@
         <!-- Message body (answer) -->
         {#if msg.content}
           <div class="chat__msg-body">{msg.content}</div>
+          {#if msg.timedOut}
+            <button class="chat__retry" onclick={() => handleSend(lastQuery)}>↺ Retry</button>
+          {/if}
         {/if}
       </div>
     {/each}
@@ -355,6 +392,24 @@
     flex-direction: column;
     gap: 4px;
   }
+
+  /* ── Load earlier button ── */
+  .chat__load-earlier {
+    align-self: center; padding: 5px 14px;
+    background: var(--bg-tertiary); border: 1px solid var(--border);
+    border-radius: 12px; font-size: 11px; color: var(--text-secondary);
+    cursor: pointer; margin-bottom: 4px;
+  }
+  .chat__load-earlier:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+  /* ── Timeout retry button ── */
+  .chat__retry {
+    align-self: flex-start; margin-top: 4px; padding: 4px 12px;
+    background: rgba(248, 81, 73, 0.1); border: 1px solid rgba(248, 81, 73, 0.3);
+    border-radius: var(--radius-md); font-size: 12px; color: var(--accent-red);
+    cursor: pointer;
+  }
+  .chat__retry:hover { background: rgba(248, 81, 73, 0.2); }
 
   /* ── Loading dots ── */
   .chat__loading {

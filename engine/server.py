@@ -12,8 +12,9 @@ import os
 import sys
 import json
 import asyncio
+import threading
 import requests
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Callable, cast
 from contextlib import redirect_stdout
 import queue
 from dotenv import load_dotenv
@@ -25,7 +26,13 @@ if not load_dotenv():
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from src.logger import get_logger
+
+logger = get_logger("server")
 
 # Ensure engine modules are importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,11 +49,15 @@ from src.tools.editor_ui_tool import EditorUITool
 from src.tools.symbol_extractor import SymbolExtractor
 from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, PipelineContext
 
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(
     title="GitSurf Studio Engine",
     description="AI-powered codebase reasoning engine",
     version="1.0.0",
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,6 +68,7 @@ app.add_middleware(
 
 class EngineState:
     def __init__(self):
+        self._lock = threading.Lock()  # guards _ensure_initialized
         self.llm: Optional[LLMClient] = None
         self.history: Optional[HistoryManager] = None
         self.pipeline_ctx: Optional[PipelineContext] = None
@@ -71,6 +83,7 @@ class EngineState:
         self.symbol_extractor = SymbolExtractor(
             cache_dir=os.path.join(os.path.dirname(__file__), ".cache", "symbols")
         )
+        self._symbols_cache: Dict[str, tuple] = {}  # path -> (symbols_dict, mtime)
 
     def get_active_token(self) -> Optional[str]:
         return self.github_token or os.getenv("GITHUB_TOKEN")
@@ -78,25 +91,96 @@ class EngineState:
 state = EngineState()
 
 
+def _safe_path(workspace: str, user_path: str) -> str:
+    """
+    Resolve user_path and assert it lives inside workspace.
+    Uses realpath() to follow symlinks before comparing, preventing
+    symlink-based escapes and classic ../../../ traversal attacks.
+    Raises HTTP 403 if the resolved path is outside the workspace.
+    """
+    workspace_real = os.path.realpath(workspace) + os.sep
+    resolved = os.path.realpath(user_path)
+    if not resolved.startswith(workspace_real):
+        raise HTTPException(status_code=403, detail="Path outside of workspace")
+    return resolved
+
+
 class ChatRequest(BaseModel):
     query: str
-    path: str  # Absolute path to the workspace/project folder
+    path: str
     history: Optional[List[Dict[str, str]]] = []
+
+    @field_validator("query")
+    @classmethod
+    def query_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("query cannot be empty")
+        if len(v) > 20_000:
+            raise ValueError("query exceeds maximum length of 20,000 characters")
+        return v
+
+    @field_validator("path")
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("path cannot be empty")
+        return v
+
 
 class IndexRequest(BaseModel):
     path: str
 
+    @field_validator("path")
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("path cannot be empty")
+        return v
+
+
 class InitRequest(BaseModel):
-    input: str # Local path or GitHub URL
+    input: str
+
+    @field_validator("input")
+    @classmethod
+    def input_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("input cannot be empty")
+        return v
+
 
 class AutocompleteRequest(BaseModel):
-    code_context: str  # Last N lines of code before the cursor
-    file_path: str     # Current file being edited
-    path: str          # Workspace root
+    code_context: str
+    file_path: str
+    path: str
+
+    @field_validator("code_context")
+    @classmethod
+    def context_max_length(cls, v: str) -> str:
+        if len(v) > 100_000:
+            raise ValueError("code_context exceeds maximum length of 100,000 characters")
+        return v
+
 
 class WriteRequest(BaseModel):
     path: str
     content: str
+
+    @field_validator("path")
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("path cannot be empty")
+        return v
+
+    @field_validator("content")
+    @classmethod
+    def content_max_size(cls, v: str) -> str:
+        if len(v.encode("utf-8")) > 10 * 1024 * 1024:  # 10 MB
+            raise ValueError("content exceeds maximum size of 10 MB")
+        return v
+
 
 class GitStatusRequest(BaseModel):
     path: str
@@ -105,14 +189,68 @@ class GitStageRequest(BaseModel):
     path: str
     files: List[str]
 
+    @field_validator("files")
+    @classmethod
+    def files_not_empty(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ValueError("files list cannot be empty")
+        return v
+
+
 class GitCommitRequest(BaseModel):
     path: str
     message: str
+
+    @field_validator("message")
+    @classmethod
+    def message_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("commit message cannot be empty")
+        return v
+
 
 class GitForkRequest(BaseModel):
     path: str
     repo_name: str
 
+
+# ── Response Models (for OpenAPI docs) ──────────────────────────────
+
+class HealthResponse(BaseModel):
+    status: str
+    workspace: Optional[str]
+
+class InitResponse(BaseModel):
+    status: str
+    workspace_path: str
+    has_project_context: bool
+    is_github: bool
+
+class ReadResponse(BaseModel):
+    content: str
+
+class WriteResponse(BaseModel):
+    status: str
+    message: str
+
+class GitStatusResponse(BaseModel):
+    status: List[Dict[str, str]]
+
+class GitMessageResponse(BaseModel):
+    message: str
+
+class BranchResponse(BaseModel):
+    current: Optional[str]
+    branches: List[str]
+
+class SymbolResponse(BaseModel):
+    path: str
+    symbols: List[Dict]
+
+class AutocompleteResponse(BaseModel):
+    completion: str
+
+# ────────────────────────────────────────────────────────────────────
 
 AVAILABLE_TOOLS = """
 Tool: FileEditorTool
@@ -154,67 +292,78 @@ Methods:
 
 
 def _ensure_initialized(workspace_path: str):
+    # Fast path — already initialized for this workspace (no lock needed)
     if state.workspace_path == workspace_path and state.llm is not None:
         return
 
-    state.workspace_path = workspace_path
-    state.llm = LLMClient()
-    state.history = HistoryManager(
-        history_file=os.path.join(workspace_path, ".gitsurf_history.json")
-    )
+    # Slow path — acquire lock and re-check (double-checked locking pattern)
+    with state._lock:
+        if state.workspace_path == workspace_path and state.llm is not None:
+            return
 
-    # ── Wire project context ──────────────────────────────────────────
-    # Check for README variants in priority order
-    readme_candidates = ["README.md", "readme.md", "README.rst", "README.txt"]
-    state.project_context = ""
-    for candidate in readme_candidates:
-        readme_path = os.path.join(workspace_path, candidate)
-        if os.path.exists(readme_path):
-            try:
-                with open(readme_path, "r", encoding="utf-8", errors="replace") as f:
-                    readme_content = f.read()
-                print(f"[Init] Analyzing project context from {candidate}...")
-                state.project_context = state.llm.analyze_project_context(readme_content)
-                print(f"[Init] Project context ready ({len(state.project_context)} chars)")
-            except Exception as e:
-                print(f"[Init] Warning: Could not analyze README: {e}")
-            break   # stop at first found
-    # ─────────────────────────────────────────────────────────────────
+        state.workspace_path = workspace_path
+        try:
+            state.llm = LLMClient()
+        except Exception as e:
+            logger.error("Failed to initialize LLMClient: %s", e)
+            state.llm = None
+            return
 
-    file_editor = FileEditorTool(root_path=workspace_path)
-    git_tool = GitTool(root_path=workspace_path)
-    editor_ui = EditorUITool(root_path=workspace_path)
-    searcher = SearchTool()
-    web_tool = WebSearchTool()
+        state.history = HistoryManager(
+            history_file=os.path.join(workspace_path, ".gitsurf_history.json")
+        )
 
-    state.agent_tools = {
-        "FileEditorTool": file_editor,
-        "GitTool": git_tool,
-        "EditorUITool": editor_ui,
-        "SearchTool": searcher,
-        "WebSearchTool": web_tool,
-    }
-    state.git_tool = git_tool
+        # ── Wire project context ──────────────────────────────────────
+        readme_candidates = ["README.md", "readme.md", "README.rst", "README.txt"]
+        state.project_context = ""
+        for candidate in readme_candidates:
+            readme_path = os.path.join(workspace_path, candidate)
+            if os.path.exists(readme_path):
+                try:
+                    with open(readme_path, "r", encoding="utf-8", errors="replace") as f:
+                        readme_content = f.read()
+                    state.project_context = state.llm.analyze_project_context(readme_content)
+                    logger.info("Project context ready (%d chars)", len(state.project_context))
+                except Exception as e:
+                    logger.warning("Could not analyze README: %s", e)
+                break
+        # ─────────────────────────────────────────────────────────────
 
-    state.pipeline_ctx = PipelineContext(
-        search_path=workspace_path,
-        rebuild_index=False,
-    )
+        file_editor = FileEditorTool(root_path=workspace_path)
+        git_tool = GitTool(root_path=workspace_path)
+        editor_ui = EditorUITool(root_path=workspace_path)
+        searcher = SearchTool()
+        web_tool = WebSearchTool()
+
+        state.agent_tools = {
+            "FileEditorTool": file_editor,
+            "GitTool": git_tool,
+            "EditorUITool": editor_ui,
+            "SearchTool": searcher,
+            "WebSearchTool": web_tool,
+        }
+        state.git_tool = git_tool
+
+        state.pipeline_ctx = PipelineContext(
+            search_path=workspace_path,
+            rebuild_index=False,
+        )
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health():
     return {"status": "ok", "workspace": state.workspace_path}
 
 
-@app.post("/init")
-async def init_workspace(req: InitRequest):
+@app.post("/init", response_model=InitResponse)
+@limiter.limit("10/minute")
+async def init_workspace(request: Request, req: InitRequest):
     target_path = req.input.strip()
 
     if "github.com" in target_path:
         repo_name = target_path.split("github.com/")[-1].strip("/")
         if repo_name.endswith(".git"):
-            repo_name = repo_name[:-4]
+            repo_name = str(repo_name)[:-4]
             
         try:
             target_path = state.repo_manager.sync_repo(repo_name)
@@ -234,17 +383,18 @@ async def init_workspace(req: InitRequest):
         "is_github": "github.com" in req.input.lower(),
     }
 
-@app.get("/symbols")
+@app.get("/symbols", response_model=SymbolResponse)
 async def get_symbols(path: str, workspace: Optional[str] = None):
     """
     Extracts symbols (classes, functions) from a file or directory.
     If 'workspace' is provided, 'path' is treated as relative to it.
     """
-    target_path = path
-    if workspace:
-        target_path = os.path.join(workspace, path)
-    
-    target_path = os.path.abspath(target_path)
+    effective_workspace = workspace or state.workspace_path
+    if effective_workspace:
+        target_path = _safe_path(effective_workspace, os.path.join(effective_workspace, path) if workspace else path)
+    else:
+        target_path = os.path.realpath(path)
+
     if not os.path.exists(target_path):
         raise HTTPException(status_code=404, detail="Path not found")
 
@@ -262,8 +412,20 @@ async def get_symbols(path: str, workspace: Optional[str] = None):
                 symbols = []
             return {"path": path, "symbols": symbols}
         else:
-            # Extract from directory (cached or rebuild)
-            raw_symbols = state.symbol_extractor.extract_from_directory(target_path)
+            # Extract from directory — use mtime-keyed server cache to avoid
+            # re-running the extractor on every request when nothing has changed
+            try:
+                mtime = os.path.getmtime(target_path)
+            except OSError:
+                mtime = None
+
+            cached = state._symbols_cache.get(target_path)
+            if cached is not None and mtime is not None and cached[1] == mtime:
+                raw_symbols = cached[0]
+            else:
+                raw_symbols = state.symbol_extractor.extract_from_directory(target_path)
+                if mtime is not None:
+                    state._symbols_cache[target_path] = (raw_symbols, mtime)
             # Flatten dict into a list
             symbols = []
             for file_path, file_symbols in raw_symbols.items():
@@ -275,30 +437,31 @@ async def get_symbols(path: str, workspace: Optional[str] = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/git/status")
+@app.get("/git/status", response_model=GitStatusResponse)
 async def git_status(path: str):
-    _ensure_initialized(path)
-    if not state.git_tool:
+    git = state.git_tool
+    if not git:
         raise HTTPException(status_code=400, detail="GitTool not initialized")
-    return {"status": state.git_tool.get_status()}
+    status = git.get_status()
+    return {"status": status}
 
-@app.post("/git/stage")
+@app.post("/git/stage", response_model=GitMessageResponse)
 async def git_stage(req: GitStageRequest):
-    _ensure_initialized(req.path)
-    if not state.git_tool:
+    git = state.git_tool
+    if not git:
         raise HTTPException(status_code=400, detail="GitTool not initialized")
-    result = state.git_tool.stage_files(req.files)
+    result = git.stage_files(req.files)
     return {"message": result}
 
-@app.post("/git/commit")
+@app.post("/git/commit", response_model=GitMessageResponse)
 async def git_commit(req: GitCommitRequest):
-    _ensure_initialized(req.path)
-    if not state.git_tool:
+    git = state.git_tool
+    if not git:
         raise HTTPException(status_code=400, detail="GitTool not initialized")
-    result = state.git_tool.commit(req.message)
+    result = git.commit(req.message)
     return {"message": result}
 
-@app.get("/git/branch")
+@app.get("/git/branch", response_model=BranchResponse)
 async def git_branch(path: str):
     _ensure_initialized(path)
     git_tool = state.git_tool
@@ -424,23 +587,30 @@ async def auth_callback(code: str):
 @app.get("/files")
 async def get_files(path: str):
     """Returns a JSON tree of the workspace files."""
+    # Validate the requested root is within the active workspace
+    if state.workspace_path:
+        path = _safe_path(state.workspace_path, path)
+    else:
+        path = os.path.realpath(path)
+
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Path not found")
 
     def build_tree(current_path):
-        name = os.path.basename(current_path)
-        if not name and current_path: # Handle root path
-             name = current_path
+        current_path_str = str(current_path)
+        name = os.path.basename(current_path_str)
+        if not name and current_path_str: # Handle root path
+             name = current_path_str
              
-        if os.path.isfile(current_path):
-            return {"name": name, "type": "file", "path": current_path}
+        if os.path.isfile(current_path_str):
+            return {"name": name, "type": "file", "path": current_path_str}
         
         children = []
         try:
-            for item in sorted(os.listdir(current_path)):
+            for item in sorted(os.listdir(current_path_str)):
                 if item in {".git", "__pycache__", "node_modules", ".cache", "venv", ".venv"}:
                     continue
-                children.append(build_tree(os.path.join(current_path, item)))
+                children.append(build_tree(os.path.join(current_path_str, item)))
         except PermissionError:
             pass
             
@@ -449,9 +619,14 @@ async def get_files(path: str):
     return build_tree(path)
 
 
-@app.get("/read")
+@app.get("/read", response_model=ReadResponse)
 async def read_file(path: str):
     """Reads a file's content from the local disk."""
+    if state.workspace_path:
+        path = _safe_path(state.workspace_path, path)
+    else:
+        path = os.path.realpath(path)
+
     if not os.path.exists(path) or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="File not found")
     
@@ -462,21 +637,13 @@ async def read_file(path: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/write")
+@app.post("/write", response_model=WriteResponse)
 async def write_file(req: WriteRequest):
     """Writes content to a file on local disk."""
-    abs_path = os.path.abspath(req.path)
-    
-    # Safety check: Ensure the path is within the workspace if one is active
     if state.workspace_path:
-        try:
-            # commonpath is safe: /workspace/foo won't match /workspace/foobar
-            common = os.path.commonpath([abs_path, state.workspace_path])
-            if common != state.workspace_path:
-                raise HTTPException(status_code=403, detail="Path outside of workspace")
-        except ValueError:
-            # commonpath raises ValueError on Windows when paths are on different drives
-            raise HTTPException(status_code=403, detail="Path outside of workspace")
+        abs_path = _safe_path(state.workspace_path, req.path)
+    else:
+        abs_path = os.path.realpath(req.path)
     
     try:
         # Ensure parent directories exist (dirname is empty for root-level paths)
@@ -525,12 +692,20 @@ class QueueWriter:
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+@limiter.limit("10/minute")
+async def chat(request: Request, req: ChatRequest):
     _ensure_initialized(req.path)
 
     async def stream_response():
         log_queue = queue.Queue()
         result_holder = {}
+        
+        # Use local copies of state objects to satisfy type checkers
+        llm = state.llm
+        project_context = state.project_context
+        agent_tools = state.agent_tools
+        pipeline_ctx = state.pipeline_ctx
+        history = state.history
 
         def run_pipeline():
             writer = QueueWriter(log_queue)
@@ -539,12 +714,12 @@ async def chat(req: ChatRequest):
                     answer, context = run_local_pipeline(
                         question=req.query,
                         search_path=req.path,
-                        llm=state.llm,
-                        project_context=state.project_context,
+                        llm=llm,
+                        project_context=project_context,
                         available_tools=AVAILABLE_TOOLS,
-                        tools=state.agent_tools,
+                        tools=agent_tools,
                         history=req.history,
-                        ctx=state.pipeline_ctx,
+                        ctx=pipeline_ctx or PipelineContext(req.path),
                     )
                 writer.flush()
                 result_holder["answer"] = answer
@@ -558,7 +733,7 @@ async def chat(req: ChatRequest):
                 log_queue.put(None)  # Sentinel: ALWAYS signal completion
 
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, run_pipeline)
+        loop.run_in_executor(None, cast(Callable[..., Any], run_pipeline))
 
         # Poll the queue and yield each log line in real-time
         while True:
@@ -569,8 +744,8 @@ async def chat(req: ChatRequest):
                     # Pipeline finished — yield the final answer
                     answer = result_holder.get("answer", "")
                     yield json.dumps({"type": "answer", "content": answer}) + "\n"
-                    if state.history:
-                        state.history.add_interaction(req.query, answer)
+                    if history:
+                        history.add_interaction(str(req.query), str(answer))
                     return
 
                 if line.startswith("[UI_COMMAND] "):
@@ -585,7 +760,8 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/index")
-async def reindex(req: IndexRequest):
+@limiter.limit("5/minute")
+async def reindex(request: Request, req: IndexRequest):
     """Trigger a full re-index of the workspace."""
     _ensure_initialized(req.path)
 
@@ -598,27 +774,28 @@ async def reindex(req: IndexRequest):
     return {"status": "reindex_triggered", "path": req.path}
 
 
-@app.post("/autocomplete")
-async def autocomplete(req: AutocompleteRequest):
-    _ensure_initialized(req.path)
-
-    if not state.llm or not state.llm.client:
+@app.post("/autocomplete", response_model=AutocompleteResponse)
+@limiter.limit("30/minute")
+async def autocomplete(request: Request, req: AutocompleteRequest):
+    llm = state.llm
+    if not llm or not llm.client:
         raise HTTPException(status_code=503, detail="No LLM client configured")
 
+    code_ctx = str(req.code_context)
     prompt = f"""You are an expert code completion engine.
 Given the code context below, predict the next 3-5 lines of code.
 Return ONLY the code, no explanations.
 
 <file_path>{req.file_path}</file_path>
 <code_context>
-{req.code_context[-3000:]}
+{code_ctx[-3000:]}
 </code_context>
 
 Complete the code:"""
 
     try:
-        response = state.llm.client.chat.completions.create(
-            model=state.llm.fast_model,   # was hardcoded "gpt-4o-mini"
+        response = llm.client.chat.completions.create(
+            model=llm.fast_model,   # was hardcoded "gpt-4o-mini"
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.2,

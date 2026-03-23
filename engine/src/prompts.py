@@ -1,7 +1,11 @@
 from typing import List, Dict, Optional
 
-def refine_query_prompt(user_question: str, project_context: str, file_structure: str) -> str:
+def refine_query_prompt(user_question: str, history_str: str, project_context: str, file_structure: str) -> str:
     return f"""You are a technical query analyzer for an AI-powered code editor. Your sole job is to convert a raw user request into a structured JSON object for use by downstream code search and editing tools.
+
+<conversation_history>
+{history_str}
+</conversation_history>
 
 <project_context>
 {project_context}
@@ -340,7 +344,8 @@ Your response MUST follow this exact structure:
 
 ANSWER:
 <Your direct answer. Lead with the conclusion, not the preamble.
- Be concise. If the answer is a location in code, state it immediately.>
+ Be concise. If the answer is a location in code, state it immediately.
+ Use rich Markdown formatting (like bullet points, bolding, and code blocks) to make the answer easy to read.>
 
 EVIDENCE:
 <Quote or reference the specific file(s) and line(s) from <context> that support your answer.
@@ -476,6 +481,7 @@ def decide_action_prompt(
     ) if is_last else ""
 
     return f"""You are an autonomous software agent inside GitSurf Studio.
+You HAVE full capability to read, edit, create, and delete files on the user's local machine using your tools. Do not claim you cannot edit code. If asked to change code, use your tools to do so!
 You are on step {current_iteration} of {max_iterations}.{iteration_warning}
 
 <available_tools>
@@ -524,7 +530,7 @@ TOOL CALL — return this shape if you need more information:
 FINAL ANSWER — return this shape when you have enough context:
 {{
   "action": "final_answer",
-  "content": "<your complete response to the user>",
+  "content": "<your complete response to the user. Use beautiful Markdown formatting (bullet points, bold text, code blocks) to ensure maximum readability.>",
   "thought": "<one sentence: why you have sufficient context to answer now>"
 }}
 
