@@ -46,3 +46,10 @@ Thumbs.db
 
 # --- Tests ---
 test*
+
+# --- History ---
+.gitsurf_history.json
+.history.json
+.history
+antigravity.MD
+CLAUDE.md

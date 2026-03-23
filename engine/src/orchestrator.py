@@ -110,6 +110,43 @@ def reciprocal_rank_fusion(results_lists: List[List[Dict]], k: int = 60) -> List
         merged.append(doc)
     return merged
 
+# Maximum characters sent to the LLM in a single action loop iteration.
+# Keeps prompts within ~20k tokens (at ~4 chars/token) to avoid API limits.
+_MAX_CONTEXT_CHARS = 80_000
+# Reserve this many chars for the initial context even when truncating logs.
+_INITIAL_CONTEXT_RESERVE = 40_000
+
+
+def _build_context_for_llm(
+    initial_context: str,
+    action_logs: List[str],
+    extra_prefix: str = "",
+) -> str:
+    """
+    Build the context string passed to the LLM, respecting _MAX_CONTEXT_CHARS.
+    Always keeps the initial context. Drops the oldest action logs first when
+    the budget is exceeded, printing a notice so the LLM knows steps were omitted.
+    """
+    prefix = f"{extra_prefix}\n\n" if extra_prefix else ""
+    base = prefix + initial_context[:_INITIAL_CONTEXT_RESERVE]
+    budget = _MAX_CONTEXT_CHARS - len(base)
+
+    if budget <= 0:
+        return base
+
+    # Fit as many recent logs as possible within the remaining budget
+    kept: List[str] = []
+    for log in reversed(action_logs):
+        if len(log) > budget:
+            break
+        kept.insert(0, log)
+        budget -= len(log)
+
+    dropped = len(action_logs) - len(kept)
+    omission = f"\n\n[{dropped} earlier action(s) omitted to stay within context limit]\n" if dropped else ""
+    return base + omission + "".join(kept)
+
+
 #  Shared: ReAct Action Loop
 def execute_action_loop(
     question: str,
@@ -129,14 +166,15 @@ def execute_action_loop(
         tools: Dict mapping tool names to instances, e.g.
                {"FileEditorTool": file_editor, "SearchTool": searcher, ...}
     """
-    full_context = initial_context
+    action_logs: List[str] = []
     answer = None
 
     for iteration in range(1, max_iterations + 1):
         print(f"   [Iteration {iteration}/{max_iterations}] Thinking...")
 
-        context_for_llm = (f"{extra_context_prefix}\n\n{full_context}".strip()
-                           if extra_context_prefix else full_context)
+        context_for_llm = _build_context_for_llm(
+            initial_context, action_logs, extra_prefix=extra_context_prefix
+        )
 
         # Reason: LLM decides next action via CoT
         decision = llm.decide_action(
@@ -180,14 +218,14 @@ def execute_action_loop(
             obs_preview = str(observation)[:200]
             print(f"   Observation: {obs_preview}...")
 
-            # Reflect: Append observation + reflection prompt
+            # Reflect: record this step as a log entry
             action_str = f"Action taken: {tool_name}.{method}({kwargs})\nObservation: {observation}"
             reflection = (
                 "\n--- REFLECT ---\n"
                 "Evaluate: Did this action achieve the goal? "
                 "If yes, provide the final answer. If not, decide the next action."
             )
-            full_context += f"\n\n--- ACTION LOG ---\n{action_str}{reflection}"
+            action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}{reflection}")
 
         else:
             print(f"   [Warning] Unknown action type: {action_type}")
@@ -242,7 +280,7 @@ def run_code_aware_pipeline(
     # Step 2: Query Refinement
     print("[Step 2/8] Refining Query (Technical Intent)...")
     refined_data = llm.refine_user_query(
-        question, project_context=project_context, file_structure=project_structure
+        question, history=history, project_context=project_context, file_structure=project_structure
     )
     query_to_use = refined_data.get("refined_question", question)
     technical_intent = refined_data.get("intent", "General search")
@@ -505,7 +543,7 @@ def run_local_pipeline(
     # Step 2: Query Refinement
     print("[Step 2/6] Refining Query...")
     refined_data = llm.refine_user_query(
-        question, project_context=project_context, file_structure=project_structure
+        question, history=history, project_context=project_context, file_structure=project_structure
     )
     query_to_use = refined_data.get("refined_question", question)
     expansion_keywords = refined_data.get("keywords", [])
