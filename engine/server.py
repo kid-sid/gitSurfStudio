@@ -108,7 +108,8 @@ class EngineState:
         self._pending_memory_save: Optional[Dict] = None  # set by /init when reindex needed
         self.chat_memory: Optional[ChatMemory] = None     # wired after LLM init
         self.mcp_manager: Optional[MCPClientManager] = None
-        self.available_tools: str = ""  # built at init time (AVAILABLE_TOOLS + MCP tools)
+        self.mcp_ready: bool = False
+        self.available_tools: str = AVAILABLE_TOOLS  # extended with MCP tools once ready
 
     def get_active_token(self) -> Optional[str]:
         return self.github_token or os.getenv("GITHUB_TOKEN")
@@ -367,6 +368,89 @@ Methods:
 """
 
 
+def _build_mcp_schema_hint(input_schema: dict) -> str:
+    """
+    Build a rich, human-readable parameter hint for an MCP tool.
+    Marks required params with *, optional with ?, includes descriptions and enum values.
+    Example: url*: string "The URL to navigate to", wait_until?: enum[load|domcontentloaded]
+    """
+    props = input_schema.get("properties", {})
+    required = set(input_schema.get("required", []))
+    if not props:
+        return ""
+    parts = []
+    for k, v in props.items():
+        req_marker = "*" if k in required else "?"
+        typ = v.get("type", "any")
+        if "enum" in v:
+            typ = "enum[" + "|".join(str(e) for e in v["enum"]) + "]"
+        elif typ == "object" and "properties" in v:
+            nested = ", ".join(
+                f"{nk}: {nv.get('type', 'any')}" for nk, nv in v["properties"].items()
+            )
+            typ = f"object{{{nested}}}"
+        hint = f"{k}{req_marker}: {typ}"
+        desc = v.get("description", "")
+        if desc:
+            hint += f' "{desc[:60]}"'
+        parts.append(hint)
+    return ", ".join(parts)
+
+
+def _init_mcp_background(config_path: str) -> None:
+    """
+    Runs in a daemon thread. Connects to all MCP servers in parallel, then
+    registers proxies into state.agent_tools and updates state.available_tools.
+    The /init endpoint returns immediately; this runs concurrently.
+    """
+    try:
+        manager = MCPClientManager()
+        manager.initialize(config_path)
+
+        mcp_tools_desc = ""
+        for tool_info in manager.list_all_tools():
+            full_key = f"mcp__{tool_info['server']}__{tool_info['name']}"
+            # Bug 1A: also register a shorthand alias (hyphens → underscores)
+            shorthand = tool_info["name"].replace("-", "_")
+            proxy = MCPToolProxy(
+                manager=manager,
+                server_name=tool_info["server"],
+                tool_name=tool_info["name"],
+                description=tool_info["description"],
+                input_schema=tool_info.get("input_schema", {}),
+            )
+            # Bug 2: rich schema hint (* = required, ? = optional)
+            schema_hint = _build_mcp_schema_hint(tool_info.get("input_schema", {}))
+            with state._lock:
+                state.agent_tools[full_key] = proxy
+                state.agent_tools[shorthand] = proxy   # alias
+
+            mcp_tools_desc += (
+                f"\nTool: {full_key}  (alias: {shorthand})\n"
+                f"Description: {tool_info['description']}\n"
+                f"Methods:\n"
+                f"  - execute({schema_hint})\n"
+                f"  NOTE: method must always be \"execute\"\n"
+            )
+
+        with state._lock:
+            state.mcp_manager = manager
+            if mcp_tools_desc:
+                state.available_tools = (
+                    AVAILABLE_TOOLS
+                    + "\n\n## MCP Tools (* = required, ? = optional)\n"
+                    + mcp_tools_desc
+                )
+            state.mcp_ready = True
+
+        tool_count = len(manager.list_all_tools())
+        logger.info("[MCP] Ready — %d tool(s) registered.", tool_count)
+    except Exception as exc:
+        logger.error("[MCP] Background init failed: %s", exc)
+        with state._lock:
+            state.mcp_ready = True   # mark ready anyway so status endpoint doesn't hang
+
+
 def _ensure_initialized(workspace_path: str):
     # Fast path — already initialized for this workspace (no lock needed)
     if state.workspace_path == workspace_path and state.llm is not None:
@@ -430,40 +514,16 @@ def _ensure_initialized(workspace_path: str):
         }
         state.git_tool = git_tool
 
-        # ── MCP tool integration ──────────────────────────────────────────────
+        # ── MCP tool integration (background — non-blocking) ─────────────────
+        state.mcp_ready = False
         _mcp_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_config.json")
-        state.mcp_manager = MCPClientManager()
-        state.mcp_manager.initialize(_mcp_config)
-
-        mcp_tools_desc = ""
-        for tool_info in state.mcp_manager.list_all_tools():
-            key = f"mcp__{tool_info['server']}__{tool_info['name']}"
-            proxy = MCPToolProxy(
-                manager=state.mcp_manager,
-                server_name=tool_info["server"],
-                tool_name=tool_info["name"],
-                description=tool_info["description"],
-                input_schema=tool_info.get("input_schema", {}),
-            )
-            state.agent_tools[key] = proxy
-
-            import json as _json
-            schema_hint = ""
-            props = tool_info.get("input_schema", {}).get("properties", {})
-            if props:
-                schema_hint = ", ".join(
-                    f"{k}: {v.get('type', 'any')}" for k, v in props.items()
-                )
-            mcp_tools_desc += (
-                f"\nTool: {key}\n"
-                f"Description: {tool_info['description']}\n"
-                f"Methods:\n"
-                f"  - execute({schema_hint})\n"
-            )
-
-        state.available_tools = AVAILABLE_TOOLS + (
-            f"\n\n## MCP Tools (external servers)\n{mcp_tools_desc}" if mcp_tools_desc else ""
+        mcp_thread = threading.Thread(
+            target=_init_mcp_background,
+            args=(_mcp_config,),
+            daemon=True,
+            name="mcp-init",
         )
+        mcp_thread.start()
         # ─────────────────────────────────────────────────────────────────────
 
 
@@ -471,6 +531,15 @@ def _ensure_initialized(workspace_path: str):
 async def _shutdown_mcp():
     if state.mcp_manager:
         state.mcp_manager.shutdown()
+
+
+@app.get("/mcp/status")
+async def mcp_status():
+    """Returns MCP readiness and list of available tool names. Poll after /init."""
+    tools = []
+    if state.mcp_manager:
+        tools = [t["name"] for t in state.mcp_manager.list_all_tools()]
+    return {"ready": state.mcp_ready, "tools": tools, "count": len(tools)}
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -34,3 +34,13 @@ class MCPToolProxy:
     def execute(self, **kwargs) -> str:
         """Synchronously dispatch the MCP tool call and return the result string."""
         return self._manager.call_tool(self._server_name, self._tool_name, kwargs)
+
+    def __getattr__(self, name: str):
+        """
+        Accept any method name the LLM might use (e.g. 'browser_navigate') and
+        route it through execute(). This prevents 'no method' errors when the LLM
+        uses a tool's native name instead of 'execute'.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return lambda **kwargs: self.execute(**kwargs)

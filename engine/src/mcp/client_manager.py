@@ -146,9 +146,28 @@ class MCPClientManager:
 
     # ── Public API ──────────────────────────────────────────────────────────
 
+    async def _connect_all(self, servers: Dict[str, Dict]) -> None:
+        """Connect to all servers in parallel using asyncio.gather."""
+        connections: Dict[str, _ServerConnection] = {}
+        for name, cfg in servers.items():
+            if cfg.get("enabled", True):
+                connections[name] = _ServerConnection(name, cfg)
+            else:
+                logger.info("[MCP] Skipping disabled server '%s'.", name)
+
+        # All npx spawns fire simultaneously — reduces 3-server startup from ~15s to ~5s
+        results = await asyncio.gather(
+            *(conn.connect() for conn in connections.values()),
+            return_exceptions=True,
+        )
+        for (name, conn), result in zip(connections.items(), results):
+            if isinstance(result, Exception):
+                logger.error("[MCP] Server '%s' failed to connect: %s", name, result)
+            self._servers[name] = conn   # register even on failure (connected=False)
+
     def initialize(self, config_path: str) -> None:
         """
-        Load mcp_config.json and connect to all enabled servers.
+        Load mcp_config.json and connect to all enabled servers in parallel.
         Safe to call from synchronous startup code.
         """
         if not MCP_AVAILABLE:
@@ -165,16 +184,11 @@ class MCPClientManager:
             logger.error("[MCP] Failed to parse mcp_config.json: %s", exc)
             return
 
-        for name, server_cfg in config.get("mcpServers", {}).items():
-            if not server_cfg.get("enabled", True):
-                logger.info("[MCP] Skipping disabled server '%s'.", name)
-                continue
-            conn = _ServerConnection(name, server_cfg)
-            try:
-                self._run(conn.connect())
-                self._servers[name] = conn
-            except Exception as exc:
-                logger.error("[MCP] Could not start server '%s': %s", name, exc)
+        servers = config.get("mcpServers", {})
+        try:
+            self._run(self._connect_all(servers))
+        except Exception as exc:
+            logger.error("[MCP] Parallel server connect failed: %s", exc)
 
     def list_all_tools(self) -> List[Dict]:
         """Return a flat list of all tools from all connected servers."""

@@ -13,6 +13,10 @@
   import { supabase, saveWorkspace, getRecentWorkspaces, deleteWorkspace } from "./lib/supabase.js";
   import { initWorkspace, checkHealth } from "./lib/api.js";
 
+  const ENGINE_URL = (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1")
+    ? `${window.location.protocol}//${window.location.hostname}:8002`
+    : "http://127.0.0.1:8002";
+
   let activeFile = $state("");
   let openFiles = $state([]);
   let workspacePath = $state("");
@@ -25,6 +29,8 @@
   let activeSidebarView = $state("explorer"); // "explorer" or "git"
   let showTerminal = $state(false);
   let recentWorkspaces = $state([]);
+  let mcpReady = $state(false);
+  let mcpToolCount = $state(0);
 
   // Ensure activeFile is always in openFiles
   $effect(() => {
@@ -98,10 +104,31 @@
       const res = await initWorkspace(initInput.trim(), initUser?.id ?? null);
       workspacePath = res.workspace_path;
       isGitHubRepo = res.is_github;
-      // Persist to workspaces table (fire-and-forget)
-      saveWorkspace(initInput.trim(), res.is_github).then(() =>
-        getRecentWorkspaces().then(ws => { recentWorkspaces = ws; }).catch(() => {})
-      ).catch(() => {});
+
+      // Bug 3: guard against 409 race condition — upsert is idempotent, silence duplicates
+      try {
+        await saveWorkspace(initInput.trim(), res.is_github);
+      } catch (e) {
+        if (!e.message?.includes("409") && !e.message?.includes("duplicate")) {
+          console.warn("[Workspace] saveWorkspace:", e.message);
+        }
+      }
+      // Small settle delay before reading back
+      await new Promise(r => setTimeout(r, 150));
+      try { recentWorkspaces = await getRecentWorkspaces(); } catch (_) {}
+
+      // Bug 4D: poll /mcp/status until MCP servers finish initializing
+      mcpReady = false;
+      mcpToolCount = 0;
+      (async function pollMcpStatus() {
+        for (let i = 0; i < 20; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          try {
+            const s = await fetch(`${ENGINE_URL}/mcp/status`).then(r => r.json());
+            if (s.ready) { mcpReady = true; mcpToolCount = s.count ?? 0; return; }
+          } catch (_) {}
+        }
+      })();
     } catch (e) {
       initError = e.message;
     } finally {
@@ -321,7 +348,7 @@
     </div>
   {/if}
 
-  <StatusBar currentFile={activeFile} {engineOnline} {workspacePath} />
+  <StatusBar currentFile={activeFile} {engineOnline} {workspacePath} {mcpReady} {mcpToolCount} />
 
   {/if} <!-- end auth gate -->
 </div>

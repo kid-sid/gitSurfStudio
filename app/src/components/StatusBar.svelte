@@ -1,5 +1,5 @@
 <script>
-  let { currentFile = "", engineOnline = false, workspacePath = "" } = $props();
+  let { currentFile = "", engineOnline = false, workspacePath = "", mcpReady = false, mcpToolCount = 0 } = $props();
 
   function getLanguage(path) {
     if (!path) return "Plain Text";
@@ -21,6 +21,11 @@
     {#if workspacePath}
       <span class="status-bar__item">📂 {workspacePath.split(/[/\\]/).pop()}</span>
     {/if}
+    {#if workspacePath}
+      <span class="status-bar__item status-bar__mcp" class:mcp-ready={mcpReady}>
+        {mcpReady ? `MCP ${mcpToolCount}` : "MCP ..."}
+      </span>
+    {/if}
   </div>
   <div class="status-bar__right">
     <span class="status-bar__item">{getLanguage(currentFile)}</span>
@@ -41,4 +46,6 @@
   .status-bar__item { opacity: 0.9; }
   .status-bar__engine { color: #ffa3a3; }
   .status-bar__engine.online { color: #a3ffba; }
+  .status-bar__mcp { color: #888; }
+  .status-bar__mcp.mcp-ready { color: #a3ffba; }
 </style>

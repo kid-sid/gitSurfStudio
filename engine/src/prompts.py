@@ -550,6 +550,7 @@ DECISION RULES — follow in order:
    State what you found and what remains unknown.
 
 MCP TOOL ROUTING — use these external tools when the built-in tools are insufficient:
+REMINDER: For ALL mcp__* tools, set "method": "execute". Never use the tool's native name as the method.
 
 5. Use mcp__context7__* when:
    - The user asks how a library, framework, or package works (e.g. "how does X work in Svelte 5?", "what's the FastAPI way to do Y?")
@@ -581,10 +582,15 @@ TOOL CALL — return this shape if you need more information:
 {{
   "action": "tool_call",
   "tool": "<exact tool name from available_tools>",
-  "method": "<exact method name>",
+  "method": "<exact method name — for mcp__* tools this is ALWAYS 'execute'>",
   "args": {{"<param_name>": "<value>"}},
   "thought": "<one sentence: what specific information you expect this call to return>"
 }}
+
+IMPORTANT — MCP tool method rule:
+For ANY tool whose name starts with "mcp__", you MUST set "method": "execute".
+NEVER use the tool's native operation name (e.g. "browser_navigate", "resolve-library-id") as the method.
+The args dict maps directly to the tool's input parameters (* = required, ? = optional).
 
 FINAL ANSWER — return this shape when you have enough context:
 {{
