@@ -51,6 +51,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.llm_client import LLMClient
 from src.history_manager import HistoryManager
+from src.memory.supabase_memory import SupabaseMemory
+from src.memory.chat_memory import ChatMemory
 from src.tools.file_editor_tool import FileEditorTool
 from src.tools.search_tool import SearchTool
 from src.tools.web_tool import WebSearchTool
@@ -62,6 +64,8 @@ from src.tools.symbol_peeker import SymbolPeeker
 from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, PipelineContext
 from src.security import PromptGuard, TopicGuard
 from src.security.supabase_logger import log_security_event
+from src.mcp.client_manager import MCPClientManager
+from src.mcp.tool_proxy import MCPToolProxy
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -100,6 +104,11 @@ class EngineState:
         self._symbols_cache: Dict[str, tuple] = {}  # path -> (symbols_dict, mtime)
         self.prompt_guard = PromptGuard()
         self.topic_guard: Optional[TopicGuard] = None  # wired after LLM init
+        self.supabase_memory = SupabaseMemory()
+        self._pending_memory_save: Optional[Dict] = None  # set by /init when reindex needed
+        self.chat_memory: Optional[ChatMemory] = None     # wired after LLM init
+        self.mcp_manager: Optional[MCPClientManager] = None
+        self.available_tools: str = ""  # built at init time (AVAILABLE_TOOLS + MCP tools)
 
     def get_active_token(self) -> Optional[str]:
         return self.github_token or os.getenv("GITHUB_TOKEN")
@@ -160,6 +169,7 @@ class IndexRequest(BaseModel):
 
 class InitRequest(BaseModel):
     input: str
+    user_id: Optional[str] = None   # Supabase auth user ID (for persistent memory)
 
     @field_validator("input")
     @classmethod
@@ -375,6 +385,10 @@ def _ensure_initialized(workspace_path: str):
             state.llm = None
             return
 
+        # Wire ChatMemory with the LLM for summarization
+        if state.chat_memory is None:
+            state.chat_memory = ChatMemory(llm_client=state.llm)
+
         state.history = HistoryManager(
             history_file=os.path.join(workspace_path, ".gitsurf_history.json")
         )
@@ -416,6 +430,48 @@ def _ensure_initialized(workspace_path: str):
         }
         state.git_tool = git_tool
 
+        # ── MCP tool integration ──────────────────────────────────────────────
+        _mcp_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_config.json")
+        state.mcp_manager = MCPClientManager()
+        state.mcp_manager.initialize(_mcp_config)
+
+        mcp_tools_desc = ""
+        for tool_info in state.mcp_manager.list_all_tools():
+            key = f"mcp__{tool_info['server']}__{tool_info['name']}"
+            proxy = MCPToolProxy(
+                manager=state.mcp_manager,
+                server_name=tool_info["server"],
+                tool_name=tool_info["name"],
+                description=tool_info["description"],
+                input_schema=tool_info.get("input_schema", {}),
+            )
+            state.agent_tools[key] = proxy
+
+            import json as _json
+            schema_hint = ""
+            props = tool_info.get("input_schema", {}).get("properties", {})
+            if props:
+                schema_hint = ", ".join(
+                    f"{k}: {v.get('type', 'any')}" for k, v in props.items()
+                )
+            mcp_tools_desc += (
+                f"\nTool: {key}\n"
+                f"Description: {tool_info['description']}\n"
+                f"Methods:\n"
+                f"  - execute({schema_hint})\n"
+            )
+
+        state.available_tools = AVAILABLE_TOOLS + (
+            f"\n\n## MCP Tools (external servers)\n{mcp_tools_desc}" if mcp_tools_desc else ""
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
+
+@app.on_event("shutdown")
+async def _shutdown_mcp():
+    if state.mcp_manager:
+        state.mcp_manager.shutdown()
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -426,12 +482,13 @@ async def health():
 @limiter.limit("10/minute")
 async def init_workspace(request: Request, req: InitRequest):
     target_path = req.input.strip()
+    is_github = "github.com" in target_path.lower()
+    repo_name: Optional[str] = None
 
-    if "github.com" in target_path:
+    if is_github:
         repo_name = target_path.split("github.com/")[-1].strip("/")
         if repo_name.endswith(".git"):
             repo_name = str(repo_name)[:-4]
-            
         try:
             target_path = state.repo_manager.sync_repo(repo_name)
         except Exception as e:
@@ -441,13 +498,45 @@ async def init_workspace(request: Request, req: InitRequest):
         if not os.path.exists(target_path):
             raise HTTPException(status_code=404, detail="Local path does not exist")
 
+    # ── Persistent memory: inject Supabase symbol cache if available ──────────
+    user_id = req.user_id
+    if user_id:
+        repo_id = SupabaseMemory.make_repo_identifier(
+            repo_name if (is_github and repo_name) else target_path, is_github=is_github
+        )
+        current_sha = SupabaseMemory.get_head_sha(target_path)
+
+        if not state.supabase_memory.needs_reindex(user_id, repo_id, current_sha):
+            # Fresh cache in Supabase — inject into local cache files
+            _engine_dir = os.path.dirname(os.path.abspath(__file__))
+            cache_base = os.path.join(_engine_dir, ".cache")
+            injected = state.supabase_memory.load_and_inject_cache(
+                user_id, repo_id,
+                symbol_cache_dir=os.path.join(cache_base, "symbols"),
+                call_graph_cache_dir=os.path.join(cache_base, "call_graph"),
+            )
+            if injected:
+                logger.info("[SupabaseMemory] Loaded symbol cache from Supabase (SHA: %s)", current_sha)
+        else:
+            # Schedule save after pipeline builds the index (done lazily by PipelineContext)
+            # We store (user_id, repo_id, sha) on state so the background save can fire later
+            state._pending_memory_save = {
+                "user_id": user_id,
+                "repo_id": repo_id,
+                "repo_display": repo_name if (is_github and repo_name) else os.path.basename(target_path),
+                "commit_sha": current_sha or "unknown",
+            }
+    else:
+        state._pending_memory_save = None
+    # ─────────────────────────────────────────────────────────────────────────
+
     _ensure_initialized(target_path)
 
     return {
         "status": "success",
         "workspace_path": target_path,
         "has_project_context": bool(state.project_context),
-        "is_github": "github.com" in req.input.lower(),
+        "is_github": is_github,
     }
 
 @app.get("/symbols", response_model=SymbolResponse)
@@ -881,6 +970,77 @@ async def complete_code(req: CompleteRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class LintRequest(BaseModel):
+    file_path: str
+    content: str
+    workspace: str = ""
+
+    @field_validator("content")
+    @classmethod
+    def content_max_size(cls, v: str) -> str:
+        if len(v.encode("utf-8")) > 1 * 1024 * 1024:  # 1 MB cap for linting
+            raise ValueError("content too large for linting")
+        return v
+
+
+@app.post("/lint")
+@limiter.limit("120/minute")
+async def lint_code(request: Request, req: LintRequest):
+    """Real-time lint — pipes editor content to ruff (Python) or eslint (JS/TS)."""
+    from src.tools.lint_tool import LintTool
+    tool = LintTool()
+    try:
+        diagnostics = tool.lint_content(req.content, req.file_path, req.workspace)
+        return {"diagnostics": diagnostics}
+    except Exception as e:
+        logger.warning("Lint endpoint error: %s", e)
+        return {"diagnostics": []}
+
+
+# ── Chat Session Endpoints ───────────────────────────────────────────────────
+
+class SessionRequest(BaseModel):
+    user_id: str
+    repo_identifier: str
+
+class NewSessionRequest(BaseModel):
+    user_id: str
+    repo_identifier: str
+    title: Optional[str] = None
+
+@app.post("/chat/sessions")
+async def create_chat_session(req: NewSessionRequest):
+    """Create a new chat session for this user+repo."""
+    if not state.chat_memory:
+        return {"session_id": None, "error": "ChatMemory not initialized"}
+    session_id = state.chat_memory.create_session(req.user_id, req.repo_identifier, req.title)
+    return {"session_id": session_id}
+
+@app.get("/chat/sessions")
+async def list_chat_sessions(user_id: str, repo_identifier: str):
+    """List recent sessions for a user+repo (newest first)."""
+    if not state.chat_memory:
+        return {"sessions": []}
+    sessions = state.chat_memory.list_sessions(user_id, repo_identifier)
+    return {"sessions": sessions}
+
+@app.get("/chat/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    """Load messages for a session (for frontend display)."""
+    if not state.chat_memory:
+        return {"messages": []}
+    messages = state.chat_memory.load_messages_for_display(session_id)
+    return {"messages": messages}
+
+@app.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session and all its messages."""
+    if not state.chat_memory:
+        return {"status": "ok"}
+    ok = state.chat_memory.delete_session(session_id)
+    return {"status": "ok" if ok else "error"}
+
+
 class QueueWriter:
     """A file-like object that pushes each print() line into a thread-safe queue."""
     def __init__(self, log_queue: queue.Queue):
@@ -939,13 +1099,31 @@ async def chat(request: Request, req: ChatRequest):
     async def stream_response():
         log_queue = queue.Queue()
         result_holder = {}
-        
+
         # Use local copies of state objects to satisfy type checkers
         llm = state.llm
         project_context = state.project_context
         agent_tools = state.agent_tools
         pipeline_ctx = state.pipeline_ctx
         history = state.history
+        chat_memory = state.chat_memory
+
+        # ── Persistent chat session ─────────────────────────────────────────
+        session_id: Optional[str] = None
+        effective_history = req.history   # default: use frontend-provided history
+
+        if req.user_id and chat_memory:
+            repo_id = SupabaseMemory.make_repo_identifier(req.path, is_github=False)
+            session_id = chat_memory.get_or_create_session(req.user_id, repo_id)
+            if session_id:
+                # Replace raw frontend history with persisted summarized context
+                persistent_ctx = chat_memory.get_context_for_llm(session_id)
+                if persistent_ctx:
+                    effective_history = persistent_ctx
+        # ───────────────────────────────────────────────────────────────────
+
+        pending_save = state._pending_memory_save
+        supabase_mem = state.supabase_memory
 
         def run_pipeline():
             writer = QueueWriter(log_queue)
@@ -956,14 +1134,41 @@ async def chat(request: Request, req: ChatRequest):
                         search_path=req.path,
                         llm=llm,
                         project_context=project_context,
-                        available_tools=AVAILABLE_TOOLS,
+                        available_tools=state.available_tools or AVAILABLE_TOOLS,
                         tools=agent_tools,
-                        history=req.history,
+                        history=effective_history,
                         ctx=pipeline_ctx or PipelineContext(req.path),
                     )
                 writer.flush()
                 result_holder["answer"] = answer
                 result_holder["context"] = context
+
+                # ── Save symbol graph to Supabase after first build ────────────
+                if pending_save and pipeline_ctx and pipeline_ctx._sym_extractor:
+                    symbols = pipeline_ctx._sym_extractor.symbols
+                    call_graph_data = None
+                    if pipeline_ctx._call_graph:
+                        try:
+                            cg = pipeline_ctx._call_graph
+                            call_graph_data = {
+                                "callees": {k: list(v) for k, v in cg.callees.items()},
+                                "callers": {k: list(v) for k, v in cg.callers.items()},
+                                "node_info": cg.node_info,
+                            }
+                        except Exception:
+                            pass
+                    if symbols:
+                        supabase_mem.schedule_save(
+                            user_id=pending_save["user_id"],
+                            repo_identifier=pending_save["repo_id"],
+                            repo_display=pending_save["repo_display"],
+                            commit_sha=pending_save["commit_sha"],
+                            symbols=symbols,
+                            call_graph=call_graph_data,
+                        )
+                        state._pending_memory_save = None  # only save once
+                # ──────────────────────────────────────────────────────────────
+
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -988,6 +1193,10 @@ async def chat(request: Request, req: ChatRequest):
                         yield json.dumps({"type": "answer", "content": answer}) + "\n"
                     if history:
                         history.add_interaction(str(req.query), str(answer))
+                    # Persist to Supabase chat session (fire-and-forget)
+                    if session_id and chat_memory:
+                        chat_memory.add_message(session_id, "user", str(req.query))
+                        chat_memory.add_message(session_id, "assistant", str(answer))
                     return
 
                 if line.startswith("[ANSWER_TOKEN]"):

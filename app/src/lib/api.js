@@ -10,12 +10,13 @@ const ENGINE_URL = (typeof window !== "undefined" && window.location.hostname !=
 /**
  * Initializes a workspace (local or GitHub)
  * @param {string} input - Local path or GitHub URL
+ * @param {string|null} userId - Supabase user ID for persistent memory
  */
-export async function initWorkspace(input) {
+export async function initWorkspace(input, userId = null) {
   const response = await fetch(`${ENGINE_URL}/init`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input }),
+    body: JSON.stringify({ input, user_id: userId }),
   });
   if (!response.ok) {
     const error = await response.json();
@@ -384,6 +385,94 @@ export async function getGitDiffLines(path) {
     return await response.json();
   } catch {
     return { added: [], modified: [] };
+  }
+}
+
+// ── Chat Session Management ───────────────────────────────────────────────────
+
+/**
+ * Lists chat sessions for a user+repo (newest first).
+ * @param {string} userId
+ * @param {string} repoIdentifier
+ */
+export async function getChatSessions(userId, repoIdentifier) {
+  try {
+    const url = `${ENGINE_URL}/chat/sessions?user_id=${encodeURIComponent(userId)}&repo_identifier=${encodeURIComponent(repoIdentifier)}`;
+    const response = await fetch(url);
+    if (!response.ok) return { sessions: [] };
+    return await response.json();
+  } catch {
+    return { sessions: [] };
+  }
+}
+
+/**
+ * Creates a new chat session.
+ * @param {string} userId
+ * @param {string} repoIdentifier
+ * @param {string|null} title
+ */
+export async function createChatSession(userId, repoIdentifier, title = null) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/chat/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, repo_identifier: repoIdentifier, title }),
+    });
+    if (!response.ok) return { session_id: null };
+    return await response.json();
+  } catch {
+    return { session_id: null };
+  }
+}
+
+/**
+ * Loads messages for a session (for displaying history).
+ * @param {string} sessionId
+ */
+export async function loadSessionMessages(sessionId) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
+    if (!response.ok) return { messages: [] };
+    return await response.json();
+  } catch {
+    return { messages: [] };
+  }
+}
+
+/**
+ * Deletes a chat session.
+ * @param {string} sessionId
+ */
+export async function deleteChatSession(sessionId) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/chat/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Lints file content via the backend (ruff for Python, eslint for JS/TS)
+ * @param {string} filePath - File path (for language detection)
+ * @param {string} content - Current editor content
+ * @param {string} workspace - Workspace root path
+ * @returns {Promise<{diagnostics: Array}>}
+ */
+export async function lintCode(filePath, content, workspace = "") {
+  try {
+    const response = await fetch(`${ENGINE_URL}/lint`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_path: filePath, content, workspace }),
+    });
+    if (!response.ok) return { diagnostics: [] };
+    return await response.json();
+  } catch {
+    return { diagnostics: [] };
   }
 }
 

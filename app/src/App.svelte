@@ -94,7 +94,8 @@
     initError = "";
     
     try {
-      const res = await initWorkspace(initInput.trim());
+      const { data: { user: initUser } } = await supabase.auth.getUser();
+      const res = await initWorkspace(initInput.trim(), initUser?.id ?? null);
       workspacePath = res.workspace_path;
       isGitHubRepo = res.is_github;
       // Persist to workspaces table (fire-and-forget)

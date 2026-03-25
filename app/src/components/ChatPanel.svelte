@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from "svelte";
-  import { sendChat, checkHealth, readFile, getFileTree } from "../lib/api.js";
+  import { sendChat, checkHealth, readFile, getFileTree, getChatSessions, createChatSession, loadSessionMessages, deleteChatSession } from "../lib/api.js";
   import { supabase } from "../lib/supabase.js";
   import { renderMarkdown } from "../lib/markdown.js";
 
@@ -21,6 +21,11 @@
   let textareaEl;                     // bound textarea element
   let abortController = null;
 
+  // ── Session management ───────────────────────────────────────────────────────
+  let sessions = $state([]);          // list of sessions for current repo
+  let activeSessionId = $state(null); // current session ID
+  let showSessionList = $state(false);
+
   // ── @mention state ──────────────────────────────────────────────────────────
   let fileList = $state([]);          // flat list of absolute file paths
   let atMention = $state(null);       // { query, matchStart } | null
@@ -32,6 +37,89 @@
           .slice(0, 8)
       : []
   );
+
+  // Load sessions when workspace changes
+  $effect(() => {
+    if (workspacePath) loadSessions();
+  });
+
+  async function loadSessions() {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user || !workspacePath) return;
+    const repoId = makeRepoIdentifier(workspacePath);
+    const { sessions: list } = await getChatSessions(user.id, repoId);
+    sessions = list ?? [];
+    // Auto-activate the most recent session (or create one)
+    if (sessions.length > 0) {
+      await switchSession(sessions[0].id);
+    } else {
+      const { session_id } = await createChatSession(user.id, repoId);
+      if (session_id) {
+        activeSessionId = session_id;
+        await loadSessions(); // refresh list
+      }
+    }
+  }
+
+  function makeRepoIdentifier(path) {
+    // Mirror the Python logic: "local:<sha8>:<folder>"
+    // We use a simple hash of the path for the frontend side
+    // (backend uses the same algorithm; this is just for API calls)
+    const folder = path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? path;
+    return `local:${simpleHash(path)}:${folder}`;
+  }
+
+  function simpleHash(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash) + str.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(16).slice(0, 8);
+  }
+
+  async function switchSession(sessionId) {
+    activeSessionId = sessionId;
+    showSessionList = false;
+    const { messages: storedMsgs } = await loadSessionMessages(sessionId);
+    messages = (storedMsgs ?? []).map(m => ({
+      role: m.role,
+      content: m.content,
+      thoughts: [],
+      thinking: false,
+      stepCount: 0,
+      isStreaming: false,
+    }));
+    visibleCount = Math.max(VISIBLE_LIMIT, messages.length);
+    setTimeout(scrollToBottom, 50);
+  }
+
+  async function handleNewChat() {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user || !workspacePath) {
+      clearChat();
+      return;
+    }
+    const repoId = makeRepoIdentifier(workspacePath);
+    const { session_id } = await createChatSession(user.id, repoId);
+    if (session_id) {
+      clearChat();
+      activeSessionId = session_id;
+      await loadSessions();
+    } else {
+      clearChat();
+    }
+  }
+
+  async function handleDeleteSession(sessionId, e) {
+    e.stopPropagation();
+    await deleteChatSession(sessionId);
+    if (activeSessionId === sessionId) {
+      await handleNewChat();
+    } else {
+      await loadSessions();
+    }
+  }
 
   onMount(() => {
     pingEngine();
@@ -297,9 +385,43 @@
     <div class="chat__header-left">
       <span class="chat__icon">🤖</span>
       <span class="chat__title">AI Assistant</span>
+      {#if sessions.length > 0}
+        <button
+          class="chat__session-toggle"
+          onclick={() => { showSessionList = !showSessionList; }}
+          title="Switch session"
+        >
+          {sessions.find(s => s.id === activeSessionId)?.title ?? "Chat"} ▾
+        </button>
+      {/if}
     </div>
-    <button class="chat__clear" onclick={clearChat} title="Clear Chat">🗑️</button>
+    <div class="chat__header-right">
+      <button class="chat__new" onclick={handleNewChat} title="New Chat">＋</button>
+      <button class="chat__clear" onclick={clearChat} title="Clear view (doesn't delete history)">🗑️</button>
+    </div>
   </div>
+
+  {#if showSessionList && sessions.length > 0}
+    <div class="chat__session-list">
+      {#each sessions as s}
+        <div
+          class="chat__session-item"
+          class:chat__session-item--active={s.id === activeSessionId}
+          role="button"
+          tabindex="0"
+          onclick={() => switchSession(s.id)}
+          onkeydown={(e) => e.key === 'Enter' && switchSession(s.id)}
+        >
+          <span class="chat__session-title">{s.title ?? "Untitled"}</span>
+          <button
+            class="chat__session-delete"
+            onclick={(e) => handleDeleteSession(s.id, e)}
+            title="Delete session"
+          >✕</button>
+        </div>
+      {/each}
+    </div>
+  {/if}
 
   <div class="chat__messages" bind:this={chatContainer}>
     {#if messages.length === 0}
@@ -453,14 +575,47 @@
     display: flex; justify-content: space-between; align-items: center;
     padding: 10px 14px; border-bottom: 1px solid var(--border);
   }
-  .chat__header-left { display: flex; align-items: center; gap: 8px; }
+  .chat__header-left { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+  .chat__header-right { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
   .chat__icon { font-size: 16px; }
   .chat__title { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+  .chat__session-toggle {
+    background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    color: var(--text-secondary); font-size: 10px; padding: 2px 6px;
+    max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: pointer;
+  }
+  .chat__session-toggle:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .chat__new {
+    background: none; font-size: 16px; font-weight: 400; padding: 2px 6px;
+    border-radius: var(--radius-sm); color: var(--text-accent); opacity: 0.7;
+  }
+  .chat__new:hover { opacity: 1; background: var(--bg-hover); }
   .chat__clear {
     background: none; font-size: 14px; padding: 2px 6px;
     border-radius: var(--radius-sm); opacity: 0.5;
   }
   .chat__clear:hover { opacity: 1; background: var(--bg-hover); }
+
+  .chat__session-list {
+    border-bottom: 1px solid var(--border); background: var(--bg-secondary);
+    max-height: 200px; overflow-y: auto;
+  }
+  .chat__session-item {
+    display: flex; align-items: center; width: 100%; padding: 7px 14px;
+    background: none; border-bottom: 1px solid var(--border-subtle);
+    font-size: 12px; color: var(--text-secondary); cursor: pointer; gap: 6px;
+    text-align: left;
+  }
+  .chat__session-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .chat__session-item--active { color: var(--text-accent); background: rgba(88,166,255,0.06); }
+  .chat__session-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat__session-delete {
+    background: none; font-size: 10px; padding: 1px 4px; border-radius: 3px;
+    color: var(--text-secondary); opacity: 0; flex-shrink: 0;
+  }
+  .chat__session-item:hover .chat__session-delete { opacity: 0.6; }
+  .chat__session-delete:hover { opacity: 1 !important; color: var(--accent-red); }
 
   .chat__messages {
     flex: 1; overflow-y: auto; padding: 12px;

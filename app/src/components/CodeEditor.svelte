@@ -1,6 +1,6 @@
 <script>
   import { onMount, onDestroy } from "svelte";
-  import { readFile, writeFile, restoreFile, cleanupBackup, deleteFile, getCompletion, peekSymbol, getGitDiffLines } from "../lib/api.js";
+  import { readFile, writeFile, restoreFile, cleanupBackup, deleteFile, getCompletion, peekSymbol, getGitDiffLines, lintCode } from "../lib/api.js";
   import * as monaco from "monaco-editor";
 
   let { activeFile = $bindable(""), openFiles = $bindable([]), workspacePath = "" } = $props();
@@ -19,6 +19,7 @@
   let writingDecorations = null;      // IDecorationsCollection for "AI writing" glow
   let gitGutterDecorations = null;    // IDecorationsCollection for git diff gutter bars
   let completionProviderDisposable = null;
+  let lintTimeout = null;
 
   // ── Language map ────────────────────────────────────────────────────────────
   const EXT_LANG = {
@@ -455,6 +456,7 @@
   });
 
   onDestroy(() => {
+    clearTimeout(lintTimeout);
     completionProviderDisposable?.dispose();
     Object.values(models).forEach(m => m.dispose());
     editor?.dispose();
@@ -491,6 +493,9 @@
         if (filesState[path]) {
           filesState[path].isDirty = models[path].getValue() !== filesState[path].original;
         }
+        // Debounced real-time lint
+        clearTimeout(lintTimeout);
+        lintTimeout = setTimeout(() => lintCurrentFile(path), 500);
       });
     }
 
@@ -523,6 +528,29 @@
       filesState[path].isLoading = false;
       swapModel(path);
     }
+  }
+
+  // ── Real-time lint ───────────────────────────────────────────────────────────
+  const LINTABLE_EXTS = new Set(["py", "js", "ts", "jsx", "tsx"]);
+
+  async function lintCurrentFile(path) {
+    if (!path || !models[path] || !workspacePath) return;
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    if (!LINTABLE_EXTS.has(ext)) return;
+    const content = models[path].getValue();
+    try {
+      const { diagnostics } = await lintCode(path, content, workspacePath);
+      const markers = (diagnostics ?? []).map((d) => ({
+        severity: d.severity === "error" ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+        startLineNumber: d.line,
+        startColumn: d.column,
+        endLineNumber: d.end_line ?? d.line,
+        endColumn: d.end_column ?? d.column + 1,
+        message: `[${d.source}] ${d.message}${d.code ? ` (${d.code})` : ""}`,
+        source: d.source,
+      }));
+      monaco.editor.setModelMarkers(models[path], "gitsurf-lint", markers);
+    } catch {}
   }
 
   // ── Save ─────────────────────────────────────────────────────────────────────

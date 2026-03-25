@@ -1,5 +1,22 @@
 from typing import List, Dict, Optional
 
+
+def summarize_chat_prompt(existing_summary: str, messages: List[Dict]) -> str:
+    """Prompt for rolling chat summarization."""
+    msgs_text = "\n".join(
+        f"{m['role'].upper()}: {m['content'][:500]}" for m in messages
+    )
+    existing = f"\nPrevious summary to incorporate:\n{existing_summary}\n" if existing_summary else ""
+    return f"""Summarize the following coding assistant conversation.
+Focus on: key decisions made, files discussed or modified, bugs found, features implemented, and any user preferences expressed.
+{existing}
+Messages to summarize:
+{msgs_text}
+
+Produce a concise summary (max 500 words) that preserves all actionable technical context.
+Do NOT include greetings or meta-commentary. Write in past tense."""
+
+
 def refine_query_prompt(user_question: str, history_str: str, project_context: str, file_structure: str) -> str:
     return f"""You are a technical query analyzer for an AI-powered code editor. Your sole job is to convert a raw user request into a structured JSON object for use by downstream code search and editing tools.
 
@@ -531,6 +548,32 @@ DECISION RULES — follow in order:
 
 4. If this is the final iteration → return final_answer regardless of confidence.
    State what you found and what remains unknown.
+
+MCP TOOL ROUTING — use these external tools when the built-in tools are insufficient:
+
+5. Use mcp__context7__* when:
+   - The user asks how a library, framework, or package works (e.g. "how does X work in Svelte 5?", "what's the FastAPI way to do Y?")
+   - You need accurate, version-aware API documentation that your training data may have wrong or outdated
+   - The user asks about syntax, method signatures, or configuration options for any dependency visible in package.json / requirements.txt / pyproject.toml
+   - PREFER this over WebSearchTool for library-specific questions — it returns structured docs, not web results
+   - Workflow: first call resolve-library-id with the library name to get its ID, then call get-library-docs with that ID and a topic
+
+6. Use mcp__playwright__* when:
+   - The user asks you to open, navigate, or interact with a URL in a real browser
+   - The user wants a screenshot of a running page (e.g. "show me how this looks", "screenshot the app")
+   - The user wants to scrape or extract content from a live website
+   - The user wants to test UI behavior by clicking, typing, or submitting forms
+   - The user says "check if X works", "verify the frontend", or "test this page"
+   - PREFER this over WebSearchTool.fetch_url when the target requires JavaScript to render
+   - Start with browser_navigate(url) then use browser_snapshot() or browser_screenshot() to capture state
+
+7. Use mcp__sequential-thinking__* when:
+   - The task requires planning across multiple files before making any edits
+   - The user asks you to design, architect, or refactor something non-trivial
+   - You are debugging a problem that spans more than 2 files and the root cause is unclear
+   - You need to reason through trade-offs before committing to an approach
+   - Use this BEFORE calling FileEditorTool on complex multi-step changes — think first, then act
+   - Call sequentialthinking with your reasoning problem; it returns a structured thought chain you can act on
 
 ---
 

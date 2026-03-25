@@ -19,9 +19,8 @@ env/
 # Secrets (injected via docker-compose env_file)
 .env
 
-# Dev history files
+# Dev history files (chat history, index metadata, etc.)
 *.json
-!requirements.txt
 
 # Logs
 *.log

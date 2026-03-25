@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "enabled": true,
+      "description": "Browser automation — navigate URLs, click elements, take screenshots, scrape web content"
+    },
+    "context7": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp@latest"],
+      "enabled": true,
+      "description": "Fetch up-to-date documentation for any library or framework by name and topic"
+    },
+    "sequential-thinking": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "enabled": true,
+      "description": "Structured multi-step reasoning scratchpad with revision and branching"
+    }
+  }
+}
