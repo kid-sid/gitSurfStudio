@@ -1,230 +1,787 @@
 <script>
   import { onMount, onDestroy } from "svelte";
-  import { readFile, writeFile } from "../lib/api.js";
+  import { readFile, writeFile, restoreFile, cleanupBackup, deleteFile, getCompletion, peekSymbol, getGitDiffLines } from "../lib/api.js";
+  import * as monaco from "monaco-editor";
 
   let { activeFile = $bindable(""), openFiles = $bindable([]), workspacePath = "" } = $props();
 
-  // state per file: mapping path to file data
+  // Per-file state
   let filesState = $state({});
 
-  onMount(() => {
-    const handleBranchChange = () => {
-      console.log("Branch changed, clearing editor cache...");
-      filesState = {}; // Clear all cache
-      if (activeFile) {
-        loadContent(activeFile);
+  // Pending AI diff: { path, stats: { added, changed, deleted } }
+  let pendingDiff = $state(null);
+
+  // Monaco instances
+  let editorContainer;
+  let editor = null;
+  let models = {};                    // path → ITextModel
+  let diffDecorations = null;         // IDecorationsCollection for AI diff highlights
+  let writingDecorations = null;      // IDecorationsCollection for "AI writing" glow
+  let gitGutterDecorations = null;    // IDecorationsCollection for git diff gutter bars
+  let completionProviderDisposable = null;
+
+  // ── Language map ────────────────────────────────────────────────────────────
+  const EXT_LANG = {
+    js: "javascript", jsx: "javascript",
+    ts: "typescript", tsx: "typescript",
+    svelte: "html",
+    py: "python",
+    json: "json", jsonc: "json",
+    css: "css", scss: "scss", less: "less",
+    html: "html", htm: "html",
+    md: "markdown",
+    yaml: "yaml", yml: "yaml",
+    toml: "plaintext",
+    sh: "shell", bash: "shell",
+    rs: "rust", go: "go",
+    java: "java", c: "c", cpp: "cpp", h: "cpp",
+    cs: "csharp", rb: "ruby", php: "php",
+    sql: "sql", xml: "xml",
+  };
+
+  function detectLanguage(path) {
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    return EXT_LANG[ext] ?? "plaintext";
+  }
+
+  // ── GitHub Dark theme ───────────────────────────────────────────────────────
+  function defineTheme() {
+    monaco.editor.defineTheme("gitsurf-dark", {
+      base: "vs-dark",
+      inherit: true,
+      rules: [
+        { token: "comment",  foreground: "8b949e", fontStyle: "italic" },
+        { token: "keyword",  foreground: "ff7b72" },
+        { token: "string",   foreground: "a5d6ff" },
+        { token: "number",   foreground: "79c0ff" },
+        { token: "type",     foreground: "d2a8ff" },
+        { token: "class",    foreground: "d2a8ff" },
+        { token: "function", foreground: "d2a8ff" },
+        { token: "variable", foreground: "ffa657" },
+        { token: "operator", foreground: "ff7b72" },
+      ],
+      colors: {
+        "editor.background":                  "#0d1117",
+        "editor.foreground":                  "#c9d1d9",
+        "editorLineNumber.foreground":        "#484f58",
+        "editorLineNumber.activeForeground":  "#c9d1d9",
+        "editor.selectionBackground":         "#264f78",
+        "editor.inactiveSelectionBackground": "#1d3247",
+        "editorCursor.foreground":            "#58a6ff",
+        "editor.lineHighlightBackground":     "#161b22",
+        "editorIndentGuide.background1":      "#21262d",
+        "editorIndentGuide.activeBackground1":"#30363d",
+        "scrollbarSlider.background":         "#30363d80",
+        "scrollbarSlider.hoverBackground":    "#484f5880",
+        "editorWidget.background":            "#161b22",
+        "editorWidget.border":                "#30363d",
+        "editorSuggestWidget.background":     "#161b22",
+        "editorSuggestWidget.border":         "#30363d",
+        "editorSuggestWidget.selectedBackground": "#21262d",
+        // Diff colours (used by our decorations)
+        "diffEditor.insertedLineBackground":  "#1b4332",
+        "diffEditor.removedLineBackground":   "#4c1c1c",
+      },
+    });
+  }
+
+  // ── Simple line diff ────────────────────────────────────────────────────────
+  function computeLineDiff(oldText, newText) {
+    const oldLines = (oldText ?? "").split("\n");
+    const newLines = (newText ?? "").split("\n");
+    const added = [], changed = [];
+
+    for (let i = 0; i < newLines.length; i++) {
+      if (i >= oldLines.length) {
+        added.push(i + 1);
+      } else if (oldLines[i] !== newLines[i]) {
+        changed.push(i + 1);
       }
+    }
+    const deleted = Math.max(0, oldLines.length - newLines.length);
+    return { added, changed, deleted };
+  }
+
+  // ── onMount ─────────────────────────────────────────────────────────────────
+  onMount(() => {
+    defineTheme();
+
+    editor = monaco.editor.create(editorContainer, {
+      theme: "gitsurf-dark",
+      automaticLayout: true,
+      fontSize: 13,
+      fontFamily: "var(--font-mono, 'JetBrains Mono', 'Fira Code', monospace)",
+      fontLigatures: true,
+      lineHeight: 20,
+      minimap: { enabled: true, scale: 1 },
+      scrollBeyondLastLine: false,
+      wordWrap: "off",
+      tabSize: 2,
+      insertSpaces: true,
+      renderWhitespace: "selection",
+      bracketPairColorization: { enabled: true },
+      guides: { bracketPairs: true, indentation: true },
+      smoothScrolling: true,
+      cursorBlinking: "smooth",
+      cursorSmoothCaretAnimation: "on",
+      padding: { top: 12, bottom: 12 },
+      overviewRulerLanes: 0,
+      hideCursorInOverviewRuler: true,
+      scrollbar: { verticalScrollbarSize: 8, horizontalScrollbarSize: 8 },
+      // Inline suggestions (Copilot-style ghost text)
+      inlineSuggest: { enabled: true },
+    });
+
+    // Ctrl+S → save
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      if (activeFile) handleSave(activeFile);
+    });
+
+    // F12 → Peek Definition (go to symbol definition)
+    editor.addCommand(monaco.KeyCode.F12, async () => {
+      const position = editor.getPosition();
+      const model = editor.getModel();
+      if (!position || !model) return;
+
+      const word = model.getWordAtPosition(position);
+      if (!word?.word) return;
+
+      let res;
+      try { res = await peekSymbol(word.word); } catch { return; }
+      if (!res?.results?.length) {
+        // Show a brief "not found" hint in the status area
+        const msg = `No definition found for "${word.word}"`;
+        editor.updateOptions({ ariaLabel: msg });
+        setTimeout(() => editor.updateOptions({ ariaLabel: "Editor" }), 2000);
+        return;
+      }
+
+      const first = res.results[0];
+      // Absolute path: results from SymbolPeeker use relative paths
+      const absPath = workspacePath
+        ? workspacePath.replace(/\\/g, "/") + "/" + first.file.replace(/\\/g, "/")
+        : first.file;
+
+      if (activeFile === absPath || activeFile === first.file) {
+        // Same file — just jump to the line
+        editor.revealLineInCenter(first.start_line);
+        editor.setPosition({ lineNumber: first.start_line, column: 1 });
+      } else {
+        // Different file — open it then navigate
+        window.dispatchEvent(new CustomEvent("navigate-to-file-line", {
+          detail: { path: absPath, line: first.start_line }
+        }));
+      }
+
+      // If multiple results, log them to console for now (full peek widget later)
+      if (res.results.length > 1) {
+        console.info(`[F12] ${res.results.length} definitions found for "${word.word}":`,
+          res.results.map(r => `${r.file}:${r.start_line}`));
+      }
+    });
+
+    // ── AI Context Menu Actions ────────────────────────────────────────────────
+    const AI_CONTEXT_ACTIONS = [
+      { id: "gitsurf.explain",  label: "⚡ Explain Selection",  autoSend: true  },
+      { id: "gitsurf.refactor", label: "🔧 Refactor Selection", autoSend: false },
+      { id: "gitsurf.fix",      label: "🐛 Fix Bug",            autoSend: false },
+      { id: "gitsurf.tests",    label: "🧪 Add Tests",          autoSend: false },
+      { id: "gitsurf.docs",     label: "📝 Add Docs",           autoSend: false },
+    ];
+
+    AI_CONTEXT_ACTIONS.forEach((action, i) => {
+      editor.addAction({
+        id: action.id,
+        label: action.label,
+        contextMenuGroupId: "z_gitsurf",
+        contextMenuOrder: i,
+        run(ed) {
+          const selection = ed.getSelection();
+          const model = ed.getModel();
+          if (!selection || !model) return;
+          const selectedText = model.getValueInRange(selection);
+          if (!selectedText.trim()) return;
+
+          const fileName = activeFile ? activeFile.split(/[/\\]/).pop() : "file";
+          const lang = detectLanguage(activeFile ?? "");
+          const codeBlock = `\`\`\`${lang}\n${selectedText}\n\`\`\``;
+
+          const queryMap = {
+            "gitsurf.explain":  `Explain this code from ${fileName}:\n\n${codeBlock}`,
+            "gitsurf.refactor": `Refactor this code from ${fileName}:\n\n${codeBlock}`,
+            "gitsurf.fix":      `Fix the bug in this code from ${fileName}:\n\n${codeBlock}`,
+            "gitsurf.tests":    `Write unit tests for this code from ${fileName}:\n\n${codeBlock}`,
+            "gitsurf.docs":     `Add documentation comments to this code from ${fileName}:\n\n${codeBlock}`,
+          };
+
+          window.dispatchEvent(new CustomEvent("chat-prefill", {
+            detail: { query: queryMap[action.id], autoSend: action.autoSend }
+          }));
+        },
+      });
+    });
+
+    // ── Feature 4: Inline completions provider ────────────────────────────────
+    completionProviderDisposable = monaco.languages.registerInlineCompletionsProvider("*", {
+      provideInlineCompletions: async (model, position, _context, token) => {
+        // Only trigger if engine is available and file is loaded
+        const path = activeFile;
+        if (!path || !filesState[path] || filesState[path].isLoading) return { items: [] };
+
+        const offset   = model.getOffsetAt(position);
+        const fullText = model.getValue();
+        const prefix   = fullText.substring(0, offset);
+        const suffix   = fullText.substring(offset);
+
+        // Don't trigger for very short prefixes
+        if (prefix.trimEnd().length < 15) return { items: [] };
+
+        try {
+          const result = await getCompletion(
+            path,
+            prefix.slice(-900),
+            suffix.slice(0, 200),
+            detectLanguage(path)
+          );
+          if (token.isCancellationRequested || !result?.completion) return { items: [] };
+
+          return {
+            items: [{
+              insertText: result.completion,
+              range: new monaco.Range(
+                position.lineNumber, position.column,
+                position.lineNumber, position.column
+              ),
+            }],
+          };
+        } catch {
+          return { items: [] };
+        }
+      },
+      freeInlineCompletions: () => {},
+    });
+
+    // ── Feature 3: AI writing decoration ─────────────────────────────────────
+    const handleWritingStart = (e) => {
+      const { path } = e.detail;
+      if (!editor) return;
+      const model = path === activeFile ? editor.getModel() : null;
+      if (!model) return;
+
+      writingDecorations?.clear();
+      const lineCount = model.getLineCount();
+      const decorations = Array.from({ length: lineCount }, (_, i) => ({
+        range: new monaco.Range(i + 1, 1, i + 1, 1),
+        options: {
+          isWholeLine: true,
+          className: "ai-writing-glow",
+          overviewRuler: { color: "#58a6ff", position: monaco.editor.OverviewRulerLane.Full },
+        },
+      }));
+      writingDecorations = editor.createDecorationsCollection(decorations);
     };
 
+    // ── Feature 1 & 2: AI diff apply + Accept/Reject ─────────────────────────
+    const handleFileChanged = async (e) => {
+      const { path } = e.detail;
+      if (!editor) return;
+
+      // Clear writing glow
+      writingDecorations?.clear();
+      writingDecorations = null;
+
+      // Get the current model content (before AI write)
+      const currentContent = models[path]
+        ? models[path].getValue()
+        : (filesState[path]?.original ?? "");
+
+      // Fetch new content from disk
+      let newContent;
+      try {
+        const res = await readFile(path);
+        newContent = res.content;
+      } catch {
+        return;
+      }
+
+      // Update model with new content
+      if (models[path]) {
+        models[path].pushEditOperations([], [{
+          range: models[path].getFullModelRange(),
+          text: newContent,
+        }], () => null);
+      } else {
+        // Model not yet created — store for when it mounts
+        if (filesState[path]) filesState[path].content = newContent;
+      }
+
+      // Compute diff and build decorations
+      const diff = computeLineDiff(currentContent, newContent);
+      const decorations = [];
+
+      diff.added.forEach(line => {
+        decorations.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            isWholeLine: true,
+            className: "ai-diff-added",
+            glyphMarginClassName: "ai-diff-glyph-added",
+            overviewRuler: { color: "#3fb950", position: monaco.editor.OverviewRulerLane.Left },
+          },
+        });
+      });
+
+      diff.changed.forEach(line => {
+        decorations.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            isWholeLine: true,
+            className: "ai-diff-changed",
+            glyphMarginClassName: "ai-diff-glyph-changed",
+            overviewRuler: { color: "#e3b341", position: monaco.editor.OverviewRulerLane.Left },
+          },
+        });
+      });
+
+      if (models[path]) {
+        diffDecorations?.clear();
+        diffDecorations = editor.createDecorationsCollection(decorations);
+      }
+
+      // Update state
+      if (filesState[path]) {
+        filesState[path].isDirty = false;
+        filesState[path].original = newContent;
+      }
+
+      pendingDiff = {
+        path,
+        stats: {
+          added: diff.added.length,
+          changed: diff.changed.length,
+          deleted: diff.deleted,
+        },
+      };
+
+      // Scroll to first changed line
+      const firstLine = diff.added[0] ?? diff.changed[0];
+      if (firstLine) editor.revealLineInCenter(firstLine);
+    };
+
+    // ── Feature: AI new file created ─────────────────────────────────────────
+    const handleFileCreated = async (e) => {
+      const { path } = e.detail;
+      if (!editor) return;
+
+      // Clear writing glow
+      writingDecorations?.clear();
+      writingDecorations = null;
+
+      // Load the new file content
+      let newContent = "";
+      try {
+        const res = await readFile(path);
+        newContent = res.content;
+      } catch {
+        return;
+      }
+
+      // Initialize filesState for this new file (no original — it's brand new)
+      filesState[path] = { content: newContent, original: null, isLoading: false, isDirty: false, isSaving: false, saveStatus: "", error: "" };
+
+      // Build and swap model
+      if (models[path]) { models[path].dispose(); delete models[path]; }
+      swapModel(path);
+
+      // Mark all lines as added
+      const lineCount = newContent.split("\n").length;
+      const decorations = Array.from({ length: lineCount }, (_, i) => ({
+        range: new monaco.Range(i + 1, 1, i + 1, 1),
+        options: {
+          isWholeLine: true,
+          className: "ai-diff-added",
+          glyphMarginClassName: "ai-diff-glyph-added",
+          overviewRuler: { color: "#3fb950", position: monaco.editor.OverviewRulerLane.Left },
+        },
+      }));
+
+      // Wait a tick so swapModel has set the model
+      setTimeout(() => {
+        if (models[path]) {
+          diffDecorations?.clear();
+          diffDecorations = editor.createDecorationsCollection(decorations);
+        }
+      }, 50);
+
+      pendingDiff = {
+        path,
+        isNewFile: true,
+        stats: { added: lineCount, changed: 0, deleted: 0 },
+      };
+    };
+
+    // ── navigate-to-line ──────────────────────────────────────────────────────
     const handleNavigate = (e) => {
       const { path, line } = e.detail;
-      if (path === activeFile) {
-        // Find the textarea and scroll to the line
-        const textarea = document.querySelector('.editor__textarea');
-        if (textarea) {
-          const lines = textarea.value.split('\n');
-          let charOffset = 0;
-          for (let i = 0; i < Math.min(line - 1, lines.length); i++) {
-            charOffset += lines[i].length + 1;
-          }
-          textarea.focus();
-          textarea.setSelectionRange(charOffset, charOffset);
-          // Simple scroll approximation (since it's a textarea)
-          const lineHeight = 20; // from CSS
-          textarea.scrollTop = (line - 1) * lineHeight;
-        }
-      } else {
-          // If the file is not active, Svelte's reactivity might take a moment to mount the textarea.
-          // In App.svelte I already ensure it opens, but let's wait a bit and try to navigate.
-          setTimeout(() => {
-              if (activeFile === path) handleNavigate(e);
-          }, 100);
+      if (path === activeFile && editor) {
+        editor.revealLineInCenter(line);
+        editor.setPosition({ lineNumber: line, column: 1 });
+        editor.focus();
       }
     };
 
-    window.addEventListener('branch-changed', handleBranchChange);
-    window.addEventListener('navigate-to-line', handleNavigate);
+    // ── branch-changed ────────────────────────────────────────────────────────
+    const handleBranchChange = () => {
+      Object.values(models).forEach(m => m.dispose());
+      models = {};
+      filesState = {};
+      pendingDiff = null;
+      if (activeFile) loadContent(activeFile);
+    };
+
+    window.addEventListener("ai-writing-start",  handleWritingStart);
+    window.addEventListener("ai-file-changed",   handleFileChanged);
+    window.addEventListener("ai-file-created",   handleFileCreated);
+    window.addEventListener("navigate-to-line",  handleNavigate);
+    window.addEventListener("branch-changed",    handleBranchChange);
 
     return () => {
-      window.removeEventListener('branch-changed', handleBranchChange);
-      window.removeEventListener('navigate-to-line', handleNavigate);
+      window.removeEventListener("ai-writing-start",  handleWritingStart);
+      window.removeEventListener("ai-file-changed",   handleFileChanged);
+      window.removeEventListener("ai-file-created",   handleFileCreated);
+      window.removeEventListener("navigate-to-line",  handleNavigate);
+      window.removeEventListener("branch-changed",    handleBranchChange);
     };
   });
 
-  // Re-fetch when activeFile changes if not already loaded
+  onDestroy(() => {
+    completionProviderDisposable?.dispose();
+    Object.values(models).forEach(m => m.dispose());
+    editor?.dispose();
+  });
+
+  // ── Reactive: swap model when activeFile changes ─────────────────────────────
   $effect(() => {
-    if (activeFile && !filesState[activeFile]) {
+    if (!editor) return;
+    if (!activeFile) {
+      editor.setModel(null);
+      return;
+    }
+    if (!filesState[activeFile]) {
       loadContent(activeFile);
+      return;
+    }
+    if (!filesState[activeFile].isLoading) {
+      swapModel(activeFile);
+      applyGitGutter(activeFile);
     }
   });
 
-  async function loadContent(path) {
-    if (!filesState[path]) {
-      filesState[path] = { content: "", original: "", isLoading: true, isSaving: false, error: "", saveStatus: "" };
-    } else {
-      filesState[path].isLoading = true;
+  function swapModel(path) {
+    if (!editor || !filesState[path] || filesState[path].isLoading) return;
+
+    if (!models[path]) {
+      const uri = monaco.Uri.parse(`file:///${path.replace(/\\/g, "/")}`);
+      models[path] = monaco.editor.createModel(
+        filesState[path].content,
+        detectLanguage(path),
+        uri
+      );
+      models[path].onDidChangeContent(() => {
+        if (filesState[path]) {
+          filesState[path].isDirty = models[path].getValue() !== filesState[path].original;
+        }
+      });
     }
-    
-    filesState[path].error = "";
-    filesState[path].saveStatus = "";
-    
+
+    editor.setModel(models[path]);
+
+    // Re-apply diff decorations if they belong to this file
+    if (pendingDiff?.path === path && diffDecorations) {
+      // decorations are already on the collection, Monaco retains them
+    }
+
+    editor.focus();
+  }
+
+  // ── Load from backend ────────────────────────────────────────────────────────
+  async function loadContent(path) {
+    filesState[path] = { content: "", original: "", isLoading: true, isDirty: false, isSaving: false, saveStatus: "", error: "" };
+
     try {
       const res = await readFile(path);
-      filesState[path].content = res.content;
+      filesState[path].content  = res.content;
       filesState[path].original = res.content;
+
+      if (models[path]) {
+        models[path].dispose();
+        delete models[path];
+      }
     } catch (e) {
-      filesState[path].error = "Failed to load file content: " + e.message;
+      filesState[path].error = "Failed to load: " + e.message;
     } finally {
       filesState[path].isLoading = false;
+      swapModel(path);
     }
   }
 
+  // ── Save ─────────────────────────────────────────────────────────────────────
   async function handleSave(path) {
     const f = filesState[path];
-    if (!path || f.isSaving || f.content === f.original) return;
+    if (!f || f.isSaving || !f.isDirty) return;
 
-    f.isSaving = true;
+    const content = models[path]?.getValue() ?? f.content;
+    f.isSaving   = true;
     f.saveStatus = "saving";
+
     try {
-      await writeFile(path, f.content);
-      f.original = f.content;
+      await writeFile(path, content);
+      f.original   = content;
+      f.isDirty    = false;
       f.saveStatus = "success";
       setTimeout(() => { if (f.saveStatus === "success") f.saveStatus = ""; }, 2000);
+      applyGitGutter(path);
     } catch (e) {
-      f.error = "Failed to save: " + e.message;
+      f.error      = "Failed to save: " + e.message;
       f.saveStatus = "error";
     } finally {
       f.isSaving = false;
     }
   }
 
-  function handleKeyDown(e, path) {
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-      e.preventDefault();
-      handleSave(path);
-    }
-    
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      const start = e.target.selectionStart;
-      const end = e.target.selectionEnd;
-      const content = filesState[path].content;
-      filesState[path].content = content.substring(0, start) + "    " + content.substring(end);
-      setTimeout(() => {
-        e.target.selectionStart = e.target.selectionEnd = start + 4;
-      }, 0);
+  // ── Git gutter diff ──────────────────────────────────────────────────────────
+  async function applyGitGutter(path) {
+    if (!editor || !path || !workspacePath) return;
+    try {
+      const { added, modified } = await getGitDiffLines(path);
+      const decorations = [];
+      for (const line of added) {
+        decorations.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            linesDecorationsClassName: "git-gutter-added-bar",
+            overviewRuler: { color: "#3fb950", position: monaco.editor.OverviewRulerLane.Right },
+          },
+        });
+      }
+      for (const line of modified) {
+        decorations.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            linesDecorationsClassName: "git-gutter-modified-bar",
+            overviewRuler: { color: "#58a6ff", position: monaco.editor.OverviewRulerLane.Right },
+          },
+        });
+      }
+      gitGutterDecorations?.clear();
+      gitGutterDecorations = editor.createDecorationsCollection(decorations);
+    } catch {
+      // silently fail — gutter is optional
     }
   }
 
+  // ── Accept AI diff ────────────────────────────────────────────────────────────
+  async function acceptDiff() {
+    if (!pendingDiff) return;
+    const { path, isNewFile } = pendingDiff;
 
+    // Finalize: sync original to current model content
+    if (filesState[path] && models[path]) {
+      const currentValue = models[path].getValue();
+      filesState[path].content  = currentValue;
+      filesState[path].original = currentValue;
+      filesState[path].isDirty  = false;
+    }
+
+    // Clean up .bak file only for edits (new files have no .bak)
+    if (!isNewFile) {
+      try { await cleanupBackup(path); } catch {}
+    }
+
+    diffDecorations?.clear();
+    diffDecorations = null;
+    pendingDiff = null;
+    applyGitGutter(path);
+  }
+
+  // ── Reject AI diff ────────────────────────────────────────────────────────────
+  async function rejectDiff() {
+    if (!pendingDiff) return;
+    const { path, isNewFile } = pendingDiff;
+
+    if (isNewFile) {
+      // Delete the newly created file and close its tab
+      try { await deleteFile(path); } catch (e) { console.error("Delete failed:", e.message); }
+      models[path]?.dispose();
+      delete models[path];
+      delete filesState[path];
+      openFiles = openFiles.filter(p => p !== path);
+      if (activeFile === path) {
+        activeFile = openFiles.length > 0 ? openFiles[openFiles.length - 1] : "";
+      }
+    } else {
+      try {
+        await restoreFile(path);
+        // Reload model from restored content
+        const res = await readFile(path);
+        if (models[path]) {
+          models[path].pushEditOperations([], [{
+            range: models[path].getFullModelRange(),
+            text: res.content,
+          }], () => null);
+        }
+        if (filesState[path]) {
+          filesState[path].content  = res.content;
+          filesState[path].original = res.content;
+          filesState[path].isDirty  = false;
+        }
+        // Clean up .bak file after restore
+        try { await cleanupBackup(path); } catch {}
+      } catch (e) {
+        console.error("Reject failed:", e.message);
+      }
+    }
+
+    diffDecorations?.clear();
+    diffDecorations = null;
+    pendingDiff = null;
+  }
+
+  // ── Close tab ────────────────────────────────────────────────────────────────
   function handleCloseTab(path, e) {
     e.stopPropagation();
     const index = openFiles.indexOf(path);
     if (index === -1) return;
 
-    openFiles = openFiles.filter(p => p !== path);
-    // Don't leak memory, but maybe keep state if they reopen? 
-    // For now, let's delete it.
+    models[path]?.dispose();
+    delete models[path];
     delete filesState[path];
 
-    if (activeFile === path) {
-      if (openFiles.length > 0) {
-        activeFile = openFiles[Math.min(index, openFiles.length - 1)];
-      } else {
-        activeFile = "";
-      }
+    if (pendingDiff?.path === path) {
+      diffDecorations?.clear();
+      pendingDiff = null;
     }
-  }
 
-  function getLineNumbers(content, isLoading) {
-    if (!content && !isLoading) return [1];
-    const lines = content.split("\n");
-    return lines.length > 0 ? lines.map((_, i) => i + 1) : [1];
+    openFiles = openFiles.filter(p => p !== path);
+    if (activeFile === path) {
+      activeFile = openFiles.length > 0
+        ? openFiles[Math.min(index, openFiles.length - 1)]
+        : "";
+    }
   }
 </script>
 
 <div class="editor">
+  <!-- Tab bar -->
   <div class="editor__tab-bar">
-    {#if openFiles.length > 0}
-      {#each openFiles as path}
-        {@const f = filesState[path] || {}}
-        {@const isModified = f.content !== f.original}
-        <button 
-          class="editor__tab" 
-          class:editor__tab--active={activeFile === path}
-          onclick={() => activeFile = path}
-        >
-          <span>{path.split(/[/\\]/).pop()}</span>
-          {#if isModified}
-            <span class="editor__modified-dot"></span>
-          {/if}
-          <span class="editor__tab-close" onclick={(e) => handleCloseTab(path, e)}>×</span>
-        </button>
-      {/each}
-      
-      <div class="editor__actions">
-        {#if activeFile && filesState[activeFile]}
-          {@const f = filesState[activeFile]}
-          {#if f.saveStatus === "success"}
-            <span class="save-toast success">Saved!</span>
-          {:else if f.saveStatus === "error"}
-            <span class="save-toast error">Failed to save</span>
-          {/if}
-          <button 
-            class="save-button" 
-            onclick={() => handleSave(activeFile)} 
-            disabled={f.content === f.original || f.isSaving}
-            title="Save (Ctrl+S)"
+    <div class="editor__tabs">
+      {#if openFiles.length > 0}
+        {#each openFiles as path}
+          {@const f = filesState[path] || {}}
+          <button
+            class="editor__tab"
+            class:editor__tab--active={activeFile === path}
+            class:editor__tab--diff={pendingDiff?.path === path}
+            onclick={() => activeFile = path}
           >
-            {f.isSaving ? "Saving..." : "Save"}
+            <span>{path.split(/[/\\]/).pop()}</span>
+            {#if f.isDirty}
+              <span class="editor__modified-dot"></span>
+            {/if}
+            <span
+              class="editor__tab-close"
+              onclick={(e) => handleCloseTab(path, e)}
+              onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { handleCloseTab(path, e); } }}
+              role="button"
+              tabindex="0"
+              title="Close tab"
+              aria-label="Close tab"
+            >
+              ×
+            </span>
           </button>
+        {/each}
+      {:else}
+        <div class="editor__tab editor__tab--active"><span>Welcome</span></div>
+      {/if}
+    </div>
+
+    <div class="editor__actions">
+      {#if activeFile && filesState[activeFile]}
+        {@const f = filesState[activeFile]}
+        {#if f.saveStatus === "success"}
+          <span class="save-toast success">Saved!</span>
+        {:else if f.saveStatus === "error"}
+          <span class="save-toast error">Failed to save</span>
+        {/if}
+        <button
+          class="save-button"
+          onclick={() => handleSave(activeFile)}
+          disabled={!f.isDirty || f.isSaving}
+          title="Save (Ctrl+S)"
+        >
+          {f.isSaving ? "Saving..." : "Save"}
+        </button>
+      {/if}
+    </div>
+  </div>
+
+  <!-- AI Diff bar (Features 1 & 2) -->
+  {#if pendingDiff && pendingDiff.path === activeFile}
+    {@const s = pendingDiff.stats}
+    {@const isNew = pendingDiff.isNewFile}
+    <div class="editor__diff-bar">
+      <span class="editor__diff-icon">{isNew ? "✨" : "⚡"}</span>
+      <span class="editor__diff-label">{isNew ? "AI created this file" : "AI edited this file"}</span>
+      <div class="editor__diff-stats">
+        {#if s.added > 0}
+          <span class="stat stat--added">+{s.added}</span>
+        {/if}
+        {#if s.changed > 0}
+          <span class="stat stat--changed">~{s.changed}</span>
+        {/if}
+        {#if s.deleted > 0}
+          <span class="stat stat--deleted">-{s.deleted}</span>
         {/if}
       </div>
-    {:else}
-      <div class="editor__tab editor__tab--active">
-        <span>Welcome</span>
+      <div class="editor__diff-actions">
+        <button class="diff-btn diff-btn--accept" onclick={acceptDiff} title={isNew ? "Keep this file" : "Keep AI changes"}>
+          ✓ {isNew ? "Keep" : "Accept"}
+        </button>
+        <button class="diff-btn diff-btn--reject" onclick={rejectDiff} title={isNew ? "Delete this file" : "Restore original"}>
+          ✗ {isNew ? "Delete" : "Reject"}
+        </button>
       </div>
-    {/if}
-  </div>
-  
-  <div class="editor__scroll-container">
+    </div>
+  {/if}
+
+  <!-- Editor body -->
+  <div class="editor__body">
     {#if !activeFile}
       <div class="editor__status welcome">
         <div class="welcome-icon">🌊</div>
         <h3>Ready to surf?</h3>
         <p>Select a file from the explorer to start editing.</p>
+        <p class="editor__hint">Tab accepts inline AI suggestions</p>
       </div>
-    {:else if filesState[activeFile]}
-      {@const f = filesState[activeFile]}
-      {#if f.isLoading}
-        <div class="editor__status">
-          <div class="spinner"></div>
-          Loading...
-        </div>
-      {:else if f.error}
-        <div class="editor__status editor__status--error">
-          <span class="error-icon">⚠️</span>
-          {f.error}
-          <button onclick={() => loadContent(activeFile)}>Retry</button>
-        </div>
-      {:else}
-        <div class="editor__content">
-          <div class="editor__gutter">
-            {#each getLineNumbers(f.content, f.isLoading) as num}
-              <div class="editor__line-num">{num}</div>
-            {/each}
-          </div>
-          <div class="editor__textarea-container">
-            <textarea
-              bind:value={f.content}
-              onkeydown={(e) => handleKeyDown(e, activeFile)}
-              spellcheck="false"
-              class="editor__textarea"
-            ></textarea>
-          </div>
-        </div>
-      {/if}
+    {:else if filesState[activeFile]?.isLoading}
+      <div class="editor__status">
+        <div class="spinner"></div>
+        Loading...
+      </div>
+    {:else if filesState[activeFile]?.error}
+      <div class="editor__status editor__status--error">
+        <span class="error-icon">⚠️</span>
+        {filesState[activeFile].error}
+        <button onclick={() => loadContent(activeFile)}>Retry</button>
+      </div>
     {/if}
+
+    <div
+      bind:this={editorContainer}
+      class="editor__monaco"
+      class:editor__monaco--hidden={!activeFile || filesState[activeFile]?.isLoading || filesState[activeFile]?.error}
+    ></div>
   </div>
 </div>
 
@@ -236,163 +793,137 @@
     background: var(--bg-primary);
     color: var(--text-primary);
   }
+
+  /* ── Tab bar ── */
   .editor__tab-bar {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
+    align-items: stretch;
     height: 36px;
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
-    padding: 0 4px;
     user-select: none;
+    overflow: hidden;
+    flex-shrink: 0;
   }
+  .editor__tabs {
+    display: flex; align-items: stretch; flex: 1;
+    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+  }
+  .editor__tabs::-webkit-scrollbar { display: none; }
   .editor__tab {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 16px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    border-bottom: 2px solid transparent;
-    cursor: pointer;
-    background: transparent;
-    transition: all 0.2s ease;
+    display: flex; align-items: center; gap: 6px; padding: 0 12px;
+    font-size: 12px; color: var(--text-secondary);
+    border-bottom: 2px solid transparent; border-right: 1px solid var(--border);
+    cursor: pointer; background: transparent; white-space: nowrap;
+    flex-shrink: 0; transition: background 0.15s, color 0.15s;
   }
   .editor__tab--active {
     color: var(--text-primary);
     border-bottom-color: var(--accent-blue);
     background: var(--bg-primary);
   }
+  .editor__tab--diff {
+    border-bottom-color: #3fb950 !important;
+  }
   .editor__modified-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent-blue);
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent-blue); flex-shrink: 0;
   }
   .editor__tab-close {
-    background: none;
-    border: none;
-    color: inherit;
-    font-size: 16px;
-    padding: 2px;
-    cursor: pointer;
-    opacity: 0.5;
-    line-height: 1;
+    background: none; border: none; color: inherit; font-size: 16px;
+    padding: 2px; cursor: pointer; opacity: 0.5; line-height: 1;
   }
   .editor__tab-close:hover { opacity: 1; color: var(--accent-red); }
 
   .editor__actions {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding-right: 8px;
+    display: flex; align-items: center; gap: 8px; padding: 0 10px;
+    flex-shrink: 0; border-left: 1px solid var(--border);
   }
-  
-  .save-toast {
-    font-size: 11px;
-    font-weight: 500;
-    animation: fadeIn 0.2s ease;
-  }
+  .save-toast { font-size: 11px; font-weight: 500; animation: fadeIn 0.2s ease; }
   .save-toast.success { color: var(--accent-green); }
-  .save-toast.error { color: var(--accent-red); }
-
-  @keyframes fadeIn { from { opacity: 0; transform: translateX(5px); } to { opacity: 1; transform: translateX(0); } }
-
+  .save-toast.error   { color: var(--accent-red); }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateX(5px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
   .save-button {
-    background: var(--accent-blue);
-    color: white;
-    border: none;
-    padding: 4px 12px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: opacity 0.2s;
+    background: var(--accent-blue); color: white; border: none;
+    padding: 4px 12px; border-radius: 4px; font-size: 11px;
+    font-weight: 600; cursor: pointer; transition: opacity 0.2s;
   }
   .save-button:hover:not(:disabled) { filter: brightness(1.1); }
   .save-button:disabled { opacity: 0.3; cursor: default; }
 
-  .editor__scroll-container {
-    flex: 1;
-    overflow: hidden; /* Scroll handled by textarea */
-    position: relative;
-    display: flex;
+  /* ── AI Diff bar (Features 1 & 2) ── */
+  .editor__diff-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 5px 12px; flex-shrink: 0;
+    background: rgba(27, 67, 50, 0.5);
+    border-bottom: 1px solid rgba(63, 185, 80, 0.3);
+    animation: slideDown 0.2s ease;
   }
-  
+  @keyframes slideDown {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .editor__diff-icon { font-size: 13px; }
+  .editor__diff-label { font-size: 12px; color: #3fb950; font-weight: 500; flex-shrink: 0; }
+  .editor__diff-stats { display: flex; gap: 6px; flex: 1; }
+  .stat {
+    font-size: 11px; font-weight: 600; font-family: var(--font-mono);
+    padding: 1px 5px; border-radius: 3px;
+  }
+  .stat--added   { color: #3fb950; background: rgba(63, 185, 80, 0.15); }
+  .stat--changed { color: #e3b341; background: rgba(227, 179, 65, 0.15); }
+  .stat--deleted { color: #f85149; background: rgba(248, 81, 73, 0.15); }
+  .editor__diff-actions { display: flex; gap: 6px; }
+  .diff-btn {
+    font-size: 11px; font-weight: 600; padding: 3px 10px;
+    border-radius: 4px; cursor: pointer; border: 1px solid;
+    transition: all 0.15s;
+  }
+  .diff-btn--accept {
+    color: #3fb950; border-color: rgba(63, 185, 80, 0.4);
+    background: rgba(63, 185, 80, 0.1);
+  }
+  .diff-btn--accept:hover { background: rgba(63, 185, 80, 0.25); }
+  .diff-btn--reject {
+    color: #f85149; border-color: rgba(248, 81, 73, 0.4);
+    background: rgba(248, 81, 73, 0.1);
+  }
+  .diff-btn--reject:hover { background: rgba(248, 81, 73, 0.25); }
+
+  /* ── Editor body ── */
+  .editor__body {
+    flex: 1; position: relative; overflow: hidden;
+  }
+  .editor__monaco {
+    position: absolute; inset: 0;
+  }
+  .editor__monaco--hidden {
+    visibility: hidden; pointer-events: none;
+  }
+
+  /* ── Status screens ── */
   .editor__status {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    color: var(--text-muted);
-    font-size: 14px;
-    text-align: center;
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    color: var(--text-muted); font-size: 14px; text-align: center;
+    z-index: 1; background: var(--bg-primary);
   }
   .editor__status.welcome { opacity: 0.7; }
   .welcome-icon { font-size: 48px; margin-bottom: 8px; }
-  .welcome h3 { color: var(--text-primary); margin: 0; }
-  .welcome p { margin: 0; font-size: 13px; }
+  .editor__status h3 { color: var(--text-primary); margin: 0; font-size: 15px; }
+  .editor__status p  { margin: 0; font-size: 13px; }
+  .editor__hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
   .editor__status--error { color: var(--accent-red); padding: 20px; }
   .error-icon { font-size: 24px; }
-
   .spinner {
-    width: 20px;
-    height: 20px;
+    width: 20px; height: 20px;
     border: 2px solid rgba(255,255,255,0.1);
     border-top-color: var(--accent-blue);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-
-  .editor__content {
-    display: flex;
-    flex: 1;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-  }
-  
-  .editor__gutter {
-    width: 50px;
-    text-align: right;
-    padding: 16px 12px 0 0;
-    user-select: none;
-    flex-shrink: 0;
-    background: var(--bg-secondary);
-    border-right: 1px solid var(--border);
-    overflow: hidden;
-  }
-  .editor__line-num {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    line-height: 20px;
-    color: var(--text-muted);
-    opacity: 0.5;
-  }
-
-  .editor__textarea-container {
-    flex: 1;
-    position: relative;
-    background: var(--bg-primary);
-  }
-
-  .editor__textarea {
-    width: 100%;
-    height: 100%;
-    border: none;
-    background: transparent;
-    color: var(--text-primary);
-    font-family: var(--font-mono);
-    font-size: 13px;
-    line-height: 20px;
-    padding: 16px;
-    resize: none;
-    outline: none;
-    tab-size: 4;
-    white-space: pre;
-    overflow: auto;
-  }
 </style>

@@ -33,3 +33,15 @@ class LLMProvider(ABC):
         Raises RuntimeError on failure.
         """
         ...
+
+    def stream_complete(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: Optional[float] = 0.1,
+    ):
+        """
+        Stream text tokens. Default fallback: yield the full complete() result at once.
+        Override in subclasses for real token-by-token streaming.
+        """
+        yield self.complete(messages, model, temperature=temperature)

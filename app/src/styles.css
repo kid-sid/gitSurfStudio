@@ -82,3 +82,60 @@ button {
 button:focus-visible {
   box-shadow: 0 0 0 2px var(--accent-blue);
 }
+
+/* ── Monaco AI Decorations ─────────────────────────────────────────────────── */
+
+/* Feature 1: AI added lines — green background */
+.ai-diff-added {
+  background: rgba(63, 185, 80, 0.12) !important;
+  border-left: 3px solid #3fb950 !important;
+}
+
+/* Feature 1: AI changed lines — amber background */
+.ai-diff-changed {
+  background: rgba(227, 179, 65, 0.1) !important;
+  border-left: 3px solid #e3b341 !important;
+}
+
+/* Glyph margin dots */
+.ai-diff-glyph-added {
+  background: #3fb950;
+  border-radius: 50%;
+  width: 8px !important;
+  height: 8px !important;
+  margin: 6px 2px;
+}
+.ai-diff-glyph-changed {
+  background: #e3b341;
+  border-radius: 50%;
+  width: 8px !important;
+  height: 8px !important;
+  margin: 6px 2px;
+}
+
+/* Git gutter diff bars — thin colored bars in the line-number margin */
+.git-gutter-added-bar {
+  width: 3px !important;
+  background: #3fb950;
+  margin-left: 1px;
+}
+.git-gutter-modified-bar {
+  width: 3px !important;
+  background: #58a6ff;
+  margin-left: 1px;
+}
+
+/* Feature 4: AI writing glow — blue pulse on all lines */
+.ai-writing-glow {
+  background: rgba(88, 166, 255, 0.07) !important;
+  border-left: 2px solid rgba(88, 166, 255, 0.4) !important;
+  animation: ai-writing-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes ai-writing-pulse {
+  0%,  100% { border-left-color: rgba(88, 166, 255, 0.2); background: rgba(88, 166, 255, 0.04) !important; }
+  50%       { border-left-color: rgba(88, 166, 255, 0.6); background: rgba(88, 166, 255, 0.10) !important; }
+}
+
+/* Feature 3: Inline suggestion ghost text — Monaco renders this natively */
+/* (styled by Monaco's inlineSuggest theme — no overrides needed) */

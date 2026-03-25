@@ -9,11 +9,23 @@ A FastAPI server that wraps the GitSurf PRAR pipeline, providing:
 """
 
 import os
+import re
 import sys
 import json
 import asyncio
 import threading
 import requests
+import subprocess
+import platform
+
+# ── Windows Subprocess Support ──────────────────────────────────────────
+# On Windows, asyncio.create_subprocess_exec/shell requires the Proactor loop.
+if platform.system() == "Windows":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass # Fallback for old/stripped environments
+# ───────────────────────────────────────────────────────────────────────
 from typing import Optional, List, Dict, Any, Callable, cast
 from contextlib import redirect_stdout
 import queue
@@ -23,7 +35,7 @@ from dotenv import load_dotenv
 if not load_dotenv():
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 from pydantic import BaseModel, field_validator
@@ -39,7 +51,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.llm_client import LLMClient
 from src.history_manager import HistoryManager
-from src.verifier import AnswerVerifier
 from src.tools.file_editor_tool import FileEditorTool
 from src.tools.search_tool import SearchTool
 from src.tools.web_tool import WebSearchTool
@@ -47,7 +58,10 @@ from src.tools.repo_manager import RepoManager
 from src.tools.git_tool import GitTool
 from src.tools.editor_ui_tool import EditorUITool
 from src.tools.symbol_extractor import SymbolExtractor
+from src.tools.symbol_peeker import SymbolPeeker
 from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, PipelineContext
+from src.security import PromptGuard, TopicGuard
+from src.security.supabase_logger import log_security_event
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -84,6 +98,8 @@ class EngineState:
             cache_dir=os.path.join(os.path.dirname(__file__), ".cache", "symbols")
         )
         self._symbols_cache: Dict[str, tuple] = {}  # path -> (symbols_dict, mtime)
+        self.prompt_guard = PromptGuard()
+        self.topic_guard: Optional[TopicGuard] = None  # wired after LLM init
 
     def get_active_token(self) -> Optional[str]:
         return self.github_token or os.getenv("GITHUB_TOKEN")
@@ -100,7 +116,9 @@ def _safe_path(workspace: str, user_path: str) -> str:
     """
     workspace_real = os.path.realpath(workspace) + os.sep
     resolved = os.path.realpath(user_path)
-    if not resolved.startswith(workspace_real):
+    # Append sep before comparing so the workspace root itself passes the check
+    # (e.g. resolved == workspace without trailing sep would otherwise be rejected)
+    if not (resolved + os.sep).startswith(workspace_real):
         raise HTTPException(status_code=403, detail="Path outside of workspace")
     return resolved
 
@@ -109,6 +127,7 @@ class ChatRequest(BaseModel):
     query: str
     path: str
     history: Optional[List[Dict[str, str]]] = []
+    user_id: Optional[str] = None   # Supabase auth user ID, passed by frontend
 
     @field_validator("query")
     @classmethod
@@ -179,6 +198,22 @@ class WriteRequest(BaseModel):
     def content_max_size(cls, v: str) -> str:
         if len(v.encode("utf-8")) > 10 * 1024 * 1024:  # 10 MB
             raise ValueError("content exceeds maximum size of 10 MB")
+        return v
+
+class RestoreRequest(BaseModel):
+    path: str
+
+class CompleteRequest(BaseModel):
+    path: str
+    prefix: str
+    suffix: str
+    language: str = "plaintext"
+
+    @field_validator("path")
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("path cannot be empty")
         return v
 
 
@@ -252,6 +287,32 @@ class AutocompleteResponse(BaseModel):
 
 # ────────────────────────────────────────────────────────────────────
 
+class SymbolPeekerTool:
+    """
+    Lazy wrapper around SymbolPeeker.
+    Builds the symbol index on first call (uses cache when available).
+    """
+
+    def __init__(self, pipeline_ctx: "PipelineContext", workspace_path: str):
+        self._ctx = pipeline_ctx
+        self._workspace = workspace_path
+        self._peeker: Optional[SymbolPeeker] = None
+
+    def _ensure_peeker(self):
+        if self._peeker is not None:
+            return
+        index = self._ctx.sym_extractor.extract_from_directory(self._workspace)
+        self._peeker = SymbolPeeker(index, self._workspace)
+
+    def peek_symbol(self, symbol_name: str) -> list:
+        """
+        Returns all definitions of symbol_name found in the workspace.
+        Each entry: {file, type, name, start_line, end_line, content}
+        """
+        self._ensure_peeker()
+        return self._peeker.peek_symbol(symbol_name)
+
+
 AVAILABLE_TOOLS = """
 Tool: FileEditorTool
 Description: Read, write, modify, or delete files inside the project directory.
@@ -288,6 +349,11 @@ Description: Search the web or fetch URL content for documentation/errors.
 Methods:
   - search(query, num_results=5)
   - fetch_url(url)
+
+Tool: SymbolPeekerTool
+Description: Peek the definition of any function or class by name (like F12 in VS Code). Returns the full source block, file path, and line range. Use this to inspect a symbol's current implementation before editing it — avoids reading entire files.
+Methods:
+  - peek_symbol(symbol_name): Returns [{file, type, name, start_line, end_line, content}]
 """
 
 
@@ -335,19 +401,20 @@ def _ensure_initialized(workspace_path: str):
         searcher = SearchTool()
         web_tool = WebSearchTool()
 
+        state.pipeline_ctx = PipelineContext(
+            search_path=workspace_path,
+            rebuild_index=False,
+        )
+
         state.agent_tools = {
             "FileEditorTool": file_editor,
             "GitTool": git_tool,
             "EditorUITool": editor_ui,
             "SearchTool": searcher,
             "WebSearchTool": web_tool,
+            "SymbolPeekerTool": SymbolPeekerTool(state.pipeline_ctx, workspace_path),
         }
         state.git_tool = git_tool
-
-        state.pipeline_ctx = PipelineContext(
-            search_path=workspace_path,
-            rebuild_index=False,
-        )
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -436,6 +503,24 @@ async def get_symbols(path: str, workspace: Optional[str] = None):
             return {"path": path, "symbols": symbols}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/peek-symbol")
+async def peek_symbol_endpoint(name: str):
+    """
+    Returns the source block(s) for a symbol name — the F12 / Peek Definition backend.
+    Each result: {file, type, name, start_line, end_line, content}
+    """
+    if not state.workspace_path:
+        raise HTTPException(status_code=400, detail="No workspace initialized")
+    tool = state.agent_tools.get("SymbolPeekerTool")
+    if not tool:
+        raise HTTPException(status_code=503, detail="SymbolPeekerTool not available")
+    try:
+        results = tool.peek_symbol(name)
+        return {"symbol": name, "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/git/status", response_model=GitStatusResponse)
 async def git_status(path: str):
@@ -584,6 +669,58 @@ async def auth_callback(code: str):
         raise HTTPException(status_code=400, detail=error_msg)
 
 
+def _parse_diff_hunks(diff_str: str) -> dict:
+    """Parse unified diff output into added/modified line numbers (1-indexed, new-file side)."""
+    added: list[int] = []
+    modified: list[int] = []
+    new_line = 0
+    pending_deletes = 0
+
+    for line in diff_str.splitlines():
+        if line.startswith("@@"):
+            m = re.search(r"\+(\d+)", line)
+            if m:
+                new_line = int(m.group(1)) - 1
+            pending_deletes = 0
+        elif line.startswith("---") or line.startswith("+++"):
+            continue
+        elif line.startswith("-"):
+            pending_deletes += 1
+        elif line.startswith("+"):
+            new_line += 1
+            if pending_deletes > 0:
+                modified.append(new_line)
+                pending_deletes -= 1
+            else:
+                added.append(new_line)
+        else:  # context line
+            new_line += 1
+            pending_deletes = 0
+
+    return {"added": added, "modified": modified}
+
+
+@app.get("/git/diff-lines")
+async def git_diff_lines(path: str):
+    """Returns added/modified line numbers vs HEAD for a file, for gutter decorations."""
+    if not state.workspace_path:
+        return {"added": [], "modified": []}
+    abs_path = _safe_path(state.workspace_path, path)
+    rel_path = os.path.relpath(abs_path, state.workspace_path)
+
+    try:
+        result = subprocess.run(
+            ["git", "diff", "HEAD", "--", rel_path],
+            capture_output=True, text=True, cwd=state.workspace_path,
+            timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return {"added": [], "modified": []}
+        return _parse_diff_hunks(result.stdout)
+    except Exception:
+        return {"added": [], "modified": []}
+
+
 @app.get("/files")
 async def get_files(path: str):
     """Returns a JSON tree of the workspace files."""
@@ -646,28 +783,100 @@ async def write_file(req: WriteRequest):
         abs_path = os.path.realpath(req.path)
     
     try:
-        # Ensure parent directories exist (dirname is empty for root-level paths)
+        # Ensure parent directories exist
         parent_dir = os.path.dirname(abs_path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
-        
-        # Use FileEditorTool if it exists to preserve its logic (e.g. rel_path handling)
-        if state.workspace_path and "FileEditorTool" in state.agent_tools:
-            editor = state.agent_tools["FileEditorTool"]
-            try:
-                rel_path = os.path.relpath(abs_path, state.workspace_path)
-                res = editor.write_file(rel_path, req.content)
-                if "[Error]" in res:
-                    raise Exception(res)
-                return {"status": "success", "message": res}
-            except ValueError:
-                # Path might be absolute but outside root or just tricky relpath
-                pass
 
-        # Fallback to direct write
+        # Write directly — do NOT use FileEditorTool here (that creates .bak files
+        # and emits AI UI commands, which are only appropriate for AI-driven edits)
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(req.content)
         return {"status": "success", "message": f"Wrote to {abs_path}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/restore")
+async def restore_file(req: RestoreRequest):
+    """Restores a file from its .bak backup created by FileEditorTool."""
+    if state.workspace_path:
+        abs_path = _safe_path(state.workspace_path, req.path)
+    else:
+        abs_path = os.path.realpath(req.path)
+
+    bak_path = abs_path + ".bak"
+    if not os.path.exists(bak_path):
+        raise HTTPException(status_code=404, detail="No backup found for this file")
+
+    try:
+        with open(bak_path, "r", encoding="utf-8") as f:
+            original = f.read()
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(original)
+        return {"status": "restored", "path": abs_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cleanup-backup")
+async def cleanup_backup(req: RestoreRequest):
+    """Deletes the .bak backup file after the user accepts or rejects an AI diff."""
+    if state.workspace_path:
+        abs_path = _safe_path(state.workspace_path, req.path)
+    else:
+        abs_path = os.path.realpath(req.path)
+
+    bak_path = abs_path + ".bak"
+    if os.path.exists(bak_path):
+        try:
+            os.remove(bak_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok"}
+
+
+@app.post("/delete-file")
+async def delete_file_endpoint(req: RestoreRequest):
+    """Deletes a newly AI-created file when the user rejects it."""
+    if state.workspace_path:
+        abs_path = _safe_path(state.workspace_path, req.path)
+    else:
+        abs_path = os.path.realpath(req.path)
+
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        os.remove(abs_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok"}
+
+
+@app.post("/complete")
+async def complete_code(req: CompleteRequest):
+    """Fast inline code completion using the LLM fast model."""
+    if not state.llm:
+        raise HTTPException(status_code=400, detail="Engine not initialized — open a workspace first")
+
+    filename = os.path.basename(req.path.replace("\\", "/").replace("file:///", ""))
+    prompt = (
+        f"You are a code completion engine for {req.language}. "
+        f"File: {filename}\n\n"
+        f"Code before cursor:\n{req.prefix[-900:]}\n"
+        f"Code after cursor:\n{req.suffix[:200]}\n\n"
+        "Complete the code at the cursor position. "
+        "Return ONLY the inserted text (1–4 lines max). No explanation, no markdown fences."
+    )
+
+    try:
+        completion = state.llm._call(
+            messages=[{"role": "user", "content": prompt}],
+            model=state.llm.fast_model,
+            temperature=0.1,
+            max_tokens=120,
+        )
+        return {"completion": completion.strip()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -694,7 +903,38 @@ class QueueWriter:
 @app.post("/chat")
 @limiter.limit("10/minute")
 async def chat(request: Request, req: ChatRequest):
+    # ── Prompt injection guard ────────────────────────────────
+    guard_result = state.prompt_guard.scan(req.query)
+    if guard_result.should_log:
+        ip = request.client.host if request.client else None
+        log_security_event(
+            query=req.query,
+            result=guard_result,
+            user_id=req.user_id,
+            ip_address=ip,
+            blocked=not guard_result.is_safe,
+        )
+    if not guard_result.is_safe:
+        raise HTTPException(
+            status_code=400,
+            detail="Query blocked by security policy. This attempt has been logged.",
+        )
+    # ─────────────────────────────────────────────────────────
     _ensure_initialized(req.path)
+
+    # ── Topic / content policy ────────────────────────────────
+    # Wire TopicGuard with the LLM client after first init
+    if state.topic_guard is None:
+        state.topic_guard = TopicGuard(llm=state.llm)
+
+    topic_result = state.topic_guard.classify(req.query)
+    if not topic_result.allowed:
+        logger.info(
+            "[TopicGuard] Rejected query (reason=%s tier=%s): %.80s",
+            topic_result.reason, topic_result.tier, req.query,
+        )
+        raise HTTPException(status_code=400, detail=topic_result.refusal_message)
+    # ─────────────────────────────────────────────────────────
 
     async def stream_response():
         log_queue = queue.Queue()
@@ -737,18 +977,27 @@ async def chat(request: Request, req: ChatRequest):
 
         # Poll the queue and yield each log line in real-time
         while True:
-            await asyncio.sleep(0.05)  # 50ms polling interval
+            await asyncio.sleep(0.02)  # 20ms polling for snappier streaming
             while not log_queue.empty():
                 line = log_queue.get_nowait()
                 if line is None:
-                    # Pipeline finished — yield the final answer
+                    # Pipeline finished — streaming answer was already sent as tokens
                     answer = result_holder.get("answer", "")
-                    yield json.dumps({"type": "answer", "content": answer}) + "\n"
+                    if not result_holder.get("answer_streamed"):
+                        # Fallback: answer was not streamed (e.g. mock provider)
+                        yield json.dumps({"type": "answer", "content": answer}) + "\n"
                     if history:
                         history.add_interaction(str(req.query), str(answer))
                     return
 
-                if line.startswith("[UI_COMMAND] "):
+                if line.startswith("[ANSWER_TOKEN]"):
+                    try:
+                        token = json.loads(line[len("[ANSWER_TOKEN]"):])
+                    except Exception:
+                        token = line[len("[ANSWER_TOKEN]"):]
+                    result_holder["answer_streamed"] = True
+                    yield json.dumps({"type": "answer_token", "content": token}) + "\n"
+                elif line.startswith("[UI_COMMAND] "):
                     parts = line.replace("[UI_COMMAND] ", "").split(" ", 1)
                     cmd = parts[0]
                     args = parts[1] if len(parts) > 1 else ""
@@ -809,6 +1058,143 @@ Complete the code:"""
         return {"completion": completion}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Autocomplete failed: {e}")
+
+# ── Embedded Terminal ────────────────────────────────────────────────────────
+
+@app.websocket("/terminal")
+async def terminal_ws(websocket: WebSocket, cwd: Optional[str] = None):
+    """
+    WebSocket terminal using ConPTY (pywinpty) on Windows, pty module on Linux/Mac.
+    Full PTY support: backspace, arrow keys, tab completion, colours all work.
+    Text messages: raw terminal input bytes (str).
+    JSON messages: {"type":"resize","cols":N,"rows":N} to resize the PTY.
+    """
+    await websocket.accept()
+
+    # Use explicitly passed cwd, fall back to workspace, then home dir
+    if cwd and os.path.isdir(cwd):
+        cwd = os.path.realpath(cwd)
+    else:
+        cwd = state.workspace_path or os.path.expanduser("~")
+    loop = asyncio.get_event_loop()
+
+    if platform.system() == "Windows":
+        # ── Windows: use pywinpty ConPTY ──────────────────────────────────────
+        try:
+            from winpty import PtyProcess
+        except ImportError:
+            await websocket.send_text(
+                "\r\n\x1b[31m[pywinpty not installed — run: pip install pywinpty]\x1b[0m\r\n"
+            )
+            await websocket.close()
+            return
+
+        try:
+            pty_proc = PtyProcess.spawn("cmd.exe", dimensions=(24, 220), cwd=cwd)
+        except Exception as e:
+            await websocket.send_text(f"\r\n\x1b[31m[PTY failed to start: {e}]\x1b[0m\r\n")
+            await websocket.close()
+            return
+
+        stop_event = asyncio.Event()
+
+        def _read_pty():
+            """Blocking PTY read — runs in a thread."""
+            while not stop_event.is_set():
+                try:
+                    data = pty_proc.read(4096)
+                    if data:
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send_text(data), loop
+                        )
+                except EOFError:
+                    break
+                except Exception:
+                    break
+
+        read_thread = threading.Thread(target=_read_pty, daemon=True)
+        read_thread.start()
+
+        try:
+            while True:
+                msg = await websocket.receive_text()
+                # JSON → resize control message
+                try:
+                    ctrl = json.loads(msg)
+                    if ctrl.get("type") == "resize":
+                        pty_proc.setwinsize(
+                            int(ctrl.get("rows", 24)),
+                            int(ctrl.get("cols", 220)),
+                        )
+                    continue
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+                # Regular keystrokes → PTY stdin
+                pty_proc.write(msg)
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            stop_event.set()
+            try:
+                pty_proc.terminate(force=True)
+            except Exception:
+                pass
+
+    else:
+        # ── Linux / Mac: use pty module ───────────────────────────────────────
+        import pty as pty_mod, fcntl, termios, struct
+
+        master_fd, slave_fd = pty_mod.openpty()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "/bin/bash",
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                cwd=cwd, close_fds=True,
+            )
+        except Exception as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            await websocket.send_text(f"\r\n\x1b[31m[Shell failed: {e}]\x1b[0m\r\n")
+            await websocket.close()
+            return
+        os.close(slave_fd)
+
+        async def _read():
+            while True:
+                try:
+                    data = await loop.run_in_executor(None, os.read, master_fd, 4096)
+                    await websocket.send_text(data.decode("utf-8", errors="replace"))
+                except Exception:
+                    break
+
+        async def _write():
+            try:
+                while True:
+                    msg = await websocket.receive_text()
+                    try:
+                        ctrl = json.loads(msg)
+                        if ctrl.get("type") == "resize":
+                            rows = int(ctrl.get("rows", 24))
+                            cols = int(ctrl.get("cols", 220))
+                            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                                        struct.pack("HHHH", rows, cols, 0, 0))
+                        continue
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+                    os.write(master_fd, msg.encode("utf-8", errors="replace"))
+            except (WebSocketDisconnect, Exception):
+                pass
+
+        try:
+            await asyncio.gather(_read(), _write())
+        finally:
+            try:
+                os.close(master_fd)
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            except Exception:
+                pass
+
 
 # entry point
 if __name__ == "__main__":

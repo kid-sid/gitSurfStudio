@@ -1,53 +1,61 @@
 <script>
-  import { getSymbols } from "../lib/api.js";
-  import { onMount } from "svelte";
+  import { getSymbols } from "../lib/api.js"
+  import { onMount } from "svelte"
 
-  let { workspacePath, activeFile = $bindable("") } = $props();
+  let { workspacePath, activeFile = $bindable("") } = $props()
 
-  let symbols = $state([]);
-  let isLoading = $state(false);
-  let error = $state("");
+  let symbols = $state([])
+  let isLoading = $state(false)
+  let error = $state("")
 
   // Re-fetch symbols when the active file or workspace changes
   $effect(() => {
     if (workspacePath) {
-      fetchSymbols();
+      fetchSymbols()
     }
-  });
+  })
 
   async function fetchSymbols() {
-    isLoading = true;
-    error = "";
+    isLoading = true
+    error = ""
     try {
       // If we have an active file, show its symbols. Otherwise, show all in workspace.
-      const target = activeFile || workspacePath;
-      const res = await getSymbols(target, workspacePath);
-      symbols = res.symbols || [];
+      const target = activeFile || workspacePath
+      const res = await getSymbols(target, workspacePath)
+      symbols = res.symbols || []
     } catch (e) {
-      error = "Failed to load symbols: " + e.message;
+      error = "Failed to load symbols: " + e.message
     } finally {
-      isLoading = false;
+      isLoading = false
     }
   }
 
   function handleSymbolClick(sym) {
-    let targetFile = sym.file || activeFile;
-    
+    let targetFile = sym.file || activeFile
+
     // Ensure we use an absolute path for activeFile
-    if (sym.file && !sym.file.includes(':') && !sym.file.startsWith('/') && !sym.file.startsWith('\\')) {
-        // Simple absolute path resolution for Windows/Unix
-        const separator = workspacePath.includes('\\') ? '\\' : '/';
-        const normalizedFile = sym.file.replace(/[/\\]/g, separator);
-        targetFile = workspacePath + (workspacePath.endsWith(separator) ? '' : separator) + normalizedFile;
+    if (
+      sym.file &&
+      !sym.file.includes(":") &&
+      !sym.file.startsWith("/") &&
+      !sym.file.startsWith("\\")
+    ) {
+      // Simple absolute path resolution for Windows/Unix
+      const separator = workspacePath.includes("\\") ? "\\" : "/"
+      const normalizedFile = sym.file.replace(/[/\\]/g, separator)
+      targetFile =
+        workspacePath + (workspacePath.endsWith(separator) ? "" : separator) + normalizedFile
     }
 
     if (targetFile !== activeFile) {
-        activeFile = targetFile;
+      activeFile = targetFile
     }
 
-    window.dispatchEvent(new CustomEvent("navigate-to-line", {
-        detail: { path: targetFile, line: sym.start_line || sym.line }
-    }));
+    window.dispatchEvent(
+      new CustomEvent("navigate-to-line", {
+        detail: { path: targetFile, line: sym.start_line || sym.line },
+      })
+    )
   }
 </script>
 
@@ -69,38 +77,42 @@
     </div>
   {:else if symbols.length === 0}
     <div class="status empty">
-      No symbols found in this {activeFile ? 'file' : 'workspace'}.
+      No symbols found in this {activeFile ? "file" : "workspace"}.
     </div>
   {:else}
     <div class="symbol-list">
       {#each symbols as sym}
         <button class="symbol-item" onclick={() => handleSymbolClick(sym)}>
-          <span class="symbol-icon" class:class={sym.type === 'class'} class:func={sym.type === 'function' || sym.type === 'method'}>
-            {sym.type === 'class' ? 'C' : sym.type === 'import' ? 'I' : 'F'}
+          <span
+            class="symbol-icon"
+            class:class={sym.type === "class"}
+            class:func={sym.type === "function" || sym.type === "method"}
+          >
+            {sym.type === "class" ? "C" : sym.type === "import" ? "I" : "F"}
           </span>
           <div class="symbol-info">
             <span class="symbol-name">{sym.name}</span>
             <span class="symbol-meta">
-                {#if sym.type === 'method' && sym.parent}
-                  {sym.parent}.
-                {/if}
-                Line {sym.start_line || sym.line}
+              {#if sym.type === "method" && sym.parent}
+                {sym.parent}.
+              {/if}
+              Line {sym.start_line || sym.line}
             </span>
           </div>
         </button>
-        
+
         {#if sym.methods && sym.methods.length > 0}
-            <div class="symbol-children">
-                {#each sym.methods as method}
-                    <button class="symbol-item child" onclick={() => handleSymbolClick(method)}>
-                        <span class="symbol-icon func">M</span>
-                        <div class="symbol-info">
-                            <span class="symbol-name">{method.name}</span>
-                            <span class="symbol-meta">Line {method.start_line}</span>
-                        </div>
-                    </button>
-                {/each}
-            </div>
+          <div class="symbol-children">
+            {#each sym.methods as method}
+              <button class="symbol-item child" onclick={() => handleSymbolClick(method)}>
+                <span class="symbol-icon func">M</span>
+                <div class="symbol-info">
+                  <span class="symbol-name">{method.name}</span>
+                  <span class="symbol-meta">Line {method.start_line}</span>
+                </div>
+              </button>
+            {/each}
+          </div>
         {/if}
       {/each}
     </div>
@@ -140,7 +152,9 @@
     opacity: 0.6;
     transition: opacity 0.2s;
   }
-  .refresh-btn:hover { opacity: 1; }
+  .refresh-btn:hover {
+    opacity: 1;
+  }
 
   .status {
     padding: 32px 16px;
@@ -148,19 +162,27 @@
     font-size: 13px;
     color: var(--text-muted);
   }
-  .status.error { color: var(--accent-red); }
-  .status.empty { opacity: 0.6; }
+  .status.error {
+    color: var(--accent-red);
+  }
+  .status.empty {
+    opacity: 0.6;
+  }
 
   .spinner {
     width: 16px;
     height: 16px;
-    border: 2px solid rgba(255,255,255,0.1);
+    border: 2px solid rgba(255, 255, 255, 0.1);
     border-top-color: var(--accent-blue);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
     margin: 0 auto 12px;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
 
   .symbol-list {
     flex: 1;
@@ -180,8 +202,12 @@
     text-align: left;
     transition: background 0.1s;
   }
-  .symbol-item:hover { background: var(--bg-hover); }
-  .symbol-item.child { padding-left: 32px; }
+  .symbol-item:hover {
+    background: var(--bg-hover);
+  }
+  .symbol-item.child {
+    padding-left: 32px;
+  }
 
   .symbol-icon {
     width: 18px;
@@ -196,8 +222,14 @@
     background: #444;
     color: #eee;
   }
-  .symbol-icon.class { background: #dcb139; color: #111; }
-  .symbol-icon.func { background: #b180d7; color: #eee; }
+  .symbol-icon.class {
+    background: #dcb139;
+    color: #111;
+  }
+  .symbol-icon.func {
+    background: #b180d7;
+    color: #eee;
+  }
 
   .symbol-info {
     display: flex;
@@ -219,7 +251,7 @@
   }
 
   .symbol-children {
-      border-left: 1px solid var(--border);
-      margin-left: 24px;
+    border-left: 1px solid var(--border);
+    margin-left: 24px;
   }
 </style>

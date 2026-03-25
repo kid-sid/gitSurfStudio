@@ -135,6 +135,7 @@ class LLMClient:
             data = _extract_json_object(content)
             if data:
                 data.setdefault("is_action_request", False)
+                data.setdefault("is_overview_question", False)
                 data.setdefault("target_files", [])
                 data.setdefault("action_type", None)
                 data.setdefault("direct_tool_call", None)
@@ -147,6 +148,7 @@ class LLMClient:
             "refined_question": user_question,
             "keywords": [],
             "is_action_request": False,
+            "is_overview_question": False,
         }
 
     def identify_relevant_files(
@@ -274,8 +276,9 @@ class LLMClient:
 
         history_str = ""
         if history:
-            history_str = "Conversation History:\n" + "".join(
-                f"{m['role'].capitalize()}: {m['content']}\n" for m in history
+            recent = history[-10:]
+            history_str = "".join(
+                f"{m['role'].upper()}: {m['content']}\n" for m in recent
             )
 
         prompt = decide_action_prompt(
@@ -319,6 +322,55 @@ class LLMClient:
                 "content": f"Agent encountered an error: {e}",
                 "thought": "Exception raised during API call.",
             }
+
+    def stream_final_answer(
+        self,
+        question: str,
+        context: str,
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """
+        Generates the final answer using streaming.
+        Tokens are printed to stdout as [ANSWER_TOKEN]<json-encoded-token>
+        so the server can forward them to the frontend in real time.
+        Returns the complete answer string.
+        """
+        if self.provider == "mock":
+            answer = "[Mock Final Answer]"
+            print(f"[ANSWER_TOKEN]{json.dumps(answer)}")
+            return answer
+
+        history_str = ""
+        if history:
+            history_str = "".join(
+                f"{m['role'].upper()}: {m['content']}\n" for m in history[-5:]
+            )
+
+        prompt = (
+            f"<conversation_history>\n{history_str}\n</conversation_history>\n\n"
+            f"<context>\n{context[:18000]}\n</context>\n\n"
+            f"Answer the following question thoroughly using the context above.\n"
+            f"Use Markdown: headings, bullet points, **bold**, and fenced code blocks where appropriate.\n\n"
+            f"Question: {question}"
+        )
+
+        messages = [
+            {"role": "system", "content": "You are an expert AI coding assistant. Answer precisely and helpfully."},
+            {"role": "user", "content": prompt},
+        ]
+
+        full_answer = ""
+        try:
+            for token in self._provider.stream_complete(messages, self.reasoning_model, temperature=0.1):
+                full_answer += token
+                # JSON-encode token so embedded newlines don't break the line protocol
+                print(f"[ANSWER_TOKEN]{json.dumps(token)}")
+        except Exception as e:
+            fallback = f"Error generating answer: {e}"
+            full_answer = fallback
+            print(f"[ANSWER_TOKEN]{json.dumps(fallback)}")
+
+        return full_answer
 
     def analyze_project_context(self, readme_content: str) -> str:
         if not readme_content or not readme_content.strip():

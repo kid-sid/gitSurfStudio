@@ -36,6 +36,8 @@ FIELD INSTRUCTIONS:
 
 "is_action_request": true ONLY if the user is requesting a direct file mutation (edit, create, delete, rename, refactor). Set to false for all questions, how-tos, and explanations.
 
+"is_overview_question": true if the user wants high-level information about the whole project that can be answered from the README or project docs — e.g. "what does this do?", "explain the project", "give me an overview", "what is this?", "how does this work?", "describe the architecture", "how do I run this?", "how to install?", "how to set up?", "how to get started?", "what are the prerequisites?", "how to use this?". Set to false for anything targeting a specific file, function, class, bug, or feature.
+
 "target_files": An array of filenames from <file_structure> most likely relevant to this request. Return an empty array [] if none are identifiable.
 
 "action_type": If is_action_request is true, classify as one of: "edit" | "create" | "delete" | "rename" | "refactor". If is_action_request is false, return null.
@@ -48,6 +50,7 @@ EXPECTED OUTPUT FORMAT:
   "refined_question": "string (max 25 words)",
   "keywords": ["str1", "str2", "..."],
   "is_action_request": boolean,
+  "is_overview_question": boolean,
   "target_files": ["filename1", "filename2"],
   "action_type": "edit" | "create" | "delete" | "rename" | "refactor" | null,
   "direct_tool_call": {{
@@ -488,6 +491,20 @@ You are on step {current_iteration} of {max_iterations}.{iteration_warning}
 {available_tools}
 </available_tools>
 
+FILE EDITING RULES (CRITICAL — follow these strictly):
+- To modify existing files (add a method, fix a bug, refactor code): ALWAYS use
+  FileEditorTool.replace_in_file(). Identify a unique target string near where
+  the change should go and replace it with the updated version including your addition.
+- To create brand new files that do not yet exist: use FileEditorTool.write_file().
+- NEVER use write_file() on an existing file unless you have read the ENTIRE file
+  first with read_file(). A partial rewrite will destroy code you cannot see.
+- Before editing any file, ALWAYS call FileEditorTool.read_file() to see the current
+  content so you can construct an accurate target string.
+
+<conversation_history>
+{history_str}
+</conversation_history>
+
 <project_structure>
 {project_structure[:3000]}
 </project_structure>
@@ -496,7 +513,6 @@ You are on step {current_iteration} of {max_iterations}.{iteration_warning}
 {context[:18000]}
 </accumulated_context>
 
-{history_str}
 <user_request>{user_question}</user_request>
 
 ---
@@ -530,9 +546,10 @@ TOOL CALL — return this shape if you need more information:
 FINAL ANSWER — return this shape when you have enough context:
 {{
   "action": "final_answer",
-  "content": "<your complete response to the user. Use beautiful Markdown formatting (bullet points, bold text, code blocks) to ensure maximum readability.>",
+  "content": "",
   "thought": "<one sentence: why you have sufficient context to answer now>"
 }}
+Note: Set "content" to "" — the answer text is generated separately via streaming.
 
 Return ONLY the JSON object. No markdown. No explanation."""
 

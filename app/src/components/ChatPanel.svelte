@@ -1,6 +1,8 @@
 <script>
-  import { onMount } from "svelte";
-  import { sendChat, checkHealth } from "../lib/api.js";
+  import { onMount, onDestroy } from "svelte";
+  import { sendChat, checkHealth, readFile, getFileTree } from "../lib/api.js";
+  import { supabase } from "../lib/supabase.js";
+  import { renderMarkdown } from "../lib/markdown.js";
 
   let { workspacePath = "", engineOnline = $bindable(false), oncommand = null } = $props();
 
@@ -16,30 +18,124 @@
   let statusText = $state("Thinking...");
   let lastQuery = $state("");         // for timeout retry
   let chatContainer;
+  let textareaEl;                     // bound textarea element
   let abortController = null;
+
+  // ── @mention state ──────────────────────────────────────────────────────────
+  let fileList = $state([]);          // flat list of absolute file paths
+  let atMention = $state(null);       // { query, matchStart } | null
+  let mentionIndex = $state(0);
+  let mentionResults = $derived(
+    atMention
+      ? fileList
+          .filter(p => p.replace(/\\/g, "/").toLowerCase().includes(atMention.query.toLowerCase()))
+          .slice(0, 8)
+      : []
+  );
 
   onMount(() => {
     pingEngine();
     const interval = setInterval(pingEngine, 10000);
-    return () => clearInterval(interval);
+    window.__gsOpenFile = (path) => oncommand && oncommand("open_file", path);
+
+    const handleChatPrefill = (e) => {
+      const { query, autoSend } = e.detail;
+      if (autoSend) {
+        handleSend(query);
+      } else {
+        inputText = query;
+        setTimeout(() => textareaEl?.focus(), 0);
+      }
+    };
+    window.addEventListener("chat-prefill", handleChatPrefill);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("chat-prefill", handleChatPrefill);
+    };
   });
+
+  onDestroy(() => {
+    delete window.__gsOpenFile;
+  });
+
+  // ── File list for @mentions ─────────────────────────────────────────────────
+  function flattenTree(node) {
+    if (!node) return [];
+    if (node.type === "file") return [node.path];
+    return (node.children || []).flatMap(flattenTree);
+  }
+
+  async function ensureFileList() {
+    if (fileList.length || !workspacePath) return;
+    try {
+      const tree = await getFileTree(workspacePath);
+      fileList = flattenTree(tree);
+    } catch {}
+  }
+
+  function displayMentionPath(path) {
+    const parts = path.replace(/\\/g, "/").split("/");
+    return parts.length <= 2 ? path : "…/" + parts.slice(-2).join("/");
+  }
+
+  function insertMention(path) {
+    if (!atMention || !textareaEl) return;
+    const { matchStart } = atMention;
+    const cursor = textareaEl.selectionStart ?? inputText.length;
+    const after = inputText.slice(cursor);
+    inputText = inputText.slice(0, matchStart) + `@${path} ` + after;
+    atMention = null;
+    // Restore focus and move cursor after the inserted mention
+    setTimeout(() => {
+      if (!textareaEl) return;
+      textareaEl.focus();
+      const newCursor = matchStart + path.length + 2; // "@" + path + " "
+      textareaEl.setSelectionRange(newCursor, newCursor);
+    }, 0);
+  }
+
+  // ── Resolve @mentions before sending ───────────────────────────────────────
+  async function resolveAtMentions(query) {
+    const mentionRe = /@([\w./\\:\-]+)/g;
+    const mentions = [...query.matchAll(mentionRe)].map(m => m[1]);
+    if (!mentions.length) return query;
+
+    const blocks = [];
+    for (const mention of mentions) {
+      try {
+        const res = await readFile(mention);
+        const ext = mention.split(".").pop() ?? "";
+        blocks.push(
+          `**Context from \`${mention}\`:**\n\`\`\`${ext}\n${res.content.slice(0, 4000)}\n\`\`\``
+        );
+      } catch {}
+    }
+
+    if (!blocks.length) return query;
+    return `${blocks.join("\n\n")}\n\n---\n\n${query}`;
+  }
 
   async function pingEngine() {
     engineOnline = await checkHealth();
   }
 
   async function handleSend(overrideQuery) {
-    const query = (overrideQuery ?? inputText).trim();
-    if (!query || isLoading) return;
+    const rawQuery = (overrideQuery ?? inputText).trim();
+    if (!rawQuery || isLoading) return;
 
     inputText = "";
-    lastQuery = query;
-    messages.push({ role: "user", content: query });
+    atMention = null;
+    lastQuery = rawQuery;
+    messages.push({ role: "user", content: rawQuery });
     isLoading = true;
     statusText = "🚀 Starting...";
 
+    // Resolve @mentions — inject file content into query sent to AI
+    const resolvedQuery = await resolveAtMentions(rawQuery);
+
     // Push a skeleton assistant message that will be filled in progressively
-    const assistantMsg = { role: "assistant", content: "", thoughts: [], thinking: true, stepCount: 0 };
+    const assistantMsg = { role: "assistant", content: "", thoughts: [], thinking: true, stepCount: 0, isStreaming: false };
     messages.push(assistantMsg);
     const msgIndex = messages.length - 1;
     // Snap visible window to the latest messages
@@ -57,8 +153,9 @@
 
     try {
       let answer = "";
+      const { data: { user } } = await supabase.auth.getUser();
       await sendChat(
-        query,
+        resolvedQuery,
         workspacePath || ".",
         history,
         (logLine) => {
@@ -86,11 +183,19 @@
 
           setTimeout(scrollToBottom, 50);
         },
-        (answerContent) => { answer = answerContent; },
+        (answerContent) => {
+          // Update message content progressively as tokens stream in
+          answer = answerContent;
+          messages[msgIndex].content = answerContent;
+          messages[msgIndex].isStreaming = true;
+          setTimeout(scrollToBottom, 20);
+        },
         oncommand,
-        abortController.signal
+        abortController.signal,
+        user?.id ?? null
       );
       messages[msgIndex].content = answer;
+      messages[msgIndex].isStreaming = false;
     } catch (error) {
       if (error.name === "AbortError") {
         messages[msgIndex].content = "_Stopped by user._";
@@ -99,6 +204,15 @@
           role: "error",
           content: `_Request timed out after 5 minutes._`,
           timedOut: true,
+        };
+      } else if (error.message && !error.message.startsWith("Failed to reach")) {
+        // Policy / validation refusal — show as an assistant message, not an error
+        messages[msgIndex] = {
+          role: "assistant",
+          content: error.message,
+          thoughts: [],
+          thinking: false,
+          stepCount: 0,
         };
       } else {
         messages[msgIndex] = {
@@ -109,6 +223,7 @@
     }
 
     messages[msgIndex].thinking = false;
+    messages[msgIndex].isStreaming = false;
     isLoading = false;
     abortController = null;
     setTimeout(scrollToBottom, 50);
@@ -125,9 +240,45 @@
   }
 
   function handleKeydown(event) {
+    // @mention dropdown navigation
+    if (atMention && mentionResults.length) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        mentionIndex = (mentionIndex + 1) % mentionResults.length;
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        mentionIndex = (mentionIndex - 1 + mentionResults.length) % mentionResults.length;
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        if (mentionResults[mentionIndex]) insertMention(mentionResults[mentionIndex]);
+        return;
+      }
+      if (event.key === "Escape") {
+        atMention = null;
+        return;
+      }
+    }
+
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       handleSend();
+    }
+  }
+
+  function handleInput(e) {
+    const cursor = e.target.selectionStart ?? inputText.length;
+    const before = inputText.slice(0, cursor);
+    const m = before.match(/@([\w./\\\-]*)$/);
+    if (m) {
+      atMention = { query: m[1], matchStart: cursor - m[0].length };
+      mentionIndex = 0;
+      ensureFileList();
+    } else {
+      atMention = null;
     }
   }
 
@@ -231,7 +382,18 @@
 
         <!-- Message body (answer) -->
         {#if msg.content}
-          <div class="chat__msg-body">{msg.content}</div>
+          {#if msg.role === "assistant"}
+            <div class="chat__msg-body chat__msg-body--markdown">
+              {#if msg.isStreaming}
+                <!-- Raw text during streaming for performance; markdown rendered after done -->
+                <span class="chat__streaming-text">{msg.content}<span class="chat__cursor"></span></span>
+              {:else}
+                {@html renderMarkdown(msg.content)}
+              {/if}
+            </div>
+          {:else}
+            <div class="chat__msg-body">{msg.content}</div>
+          {/if}
           {#if msg.timedOut}
             <button class="chat__retry" onclick={() => handleSend(lastQuery)}>↺ Retry</button>
           {/if}
@@ -241,12 +403,35 @@
   </div>
 
   <div class="chat__input-area">
+    <!-- @mention dropdown -->
+    {#if atMention && mentionResults.length}
+      <div class="mention-dropdown">
+        {#each mentionResults as path, i}
+          <button
+            class="mention-item"
+            class:mention-item--active={i === mentionIndex}
+            onmousedown={(e) => {
+              e.preventDefault();
+              mentionIndex = i;
+              insertMention(path);
+            }}
+          >
+
+            <span class="mention-icon">📄</span>
+            <span class="mention-path">{displayMentionPath(path)}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+
     <textarea
       class="chat__input"
       bind:value={inputText}
+      bind:this={textareaEl}
       onkeydown={handleKeydown}
-      placeholder="Ask about your codebase..."
-      rows="2"
+      oninput={handleInput}
+      placeholder="Ask about your codebase… type @ to reference a file"
+      rows="1"
       disabled={isLoading}
     ></textarea>
     {#if isLoading}
@@ -428,9 +613,53 @@
     40% { opacity: 1; transform: scale(1.2); }
   }
 
+  /* ── Streaming text ── */
+  .chat__streaming-text {
+    white-space: pre-wrap; word-break: break-word;
+    font-size: 13px; line-height: 1.6;
+  }
+  .chat__cursor {
+    display: inline-block; width: 2px; height: 1em;
+    background: var(--accent-blue); margin-left: 1px;
+    vertical-align: text-bottom;
+    animation: blink 0.8s step-end infinite;
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+
+  /* ── @mention dropdown ── */
+  .mention-dropdown {
+    position: absolute; bottom: calc(100% + 4px); left: 12px; right: 12px;
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: var(--radius-md); overflow: hidden;
+    box-shadow: 0 -4px 16px rgba(0,0,0,0.3);
+    z-index: 100;
+    max-height: 240px; overflow-y: auto;
+  }
+  .mention-item {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; padding: 7px 12px; text-align: left;
+    background: transparent; color: var(--text-secondary);
+    font-size: 12px; cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    transition: background 0.1s;
+  }
+  .mention-item:last-child { border-bottom: none; }
+  .mention-item:hover, .mention-item--active {
+    background: var(--bg-hover); color: var(--text-primary);
+  }
+  .mention-icon { font-size: 13px; flex-shrink: 0; }
+  .mention-path {
+    font-family: var(--font-mono); font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
   /* ── Input area ── */
   .chat__input-area {
-    display: flex; gap: 8px; padding: 12px;
+    position: relative;
+    display: flex; align-items: flex-end; gap: 8px; padding: 10px 12px;
     border-top: 1px solid var(--border); background: var(--bg-secondary);
   }
   .chat__input {
@@ -438,20 +667,21 @@
     border-radius: var(--radius-md); background: var(--bg-primary);
     color: var(--text-primary); font-family: var(--font-ui); font-size: 13px;
     padding: 8px 12px; outline: none; transition: border-color var(--transition);
+    line-height: 1.5; min-height: 36px; max-height: 120px;
   }
   .chat__input:focus { border-color: var(--accent-blue); }
   .chat__input::placeholder { color: var(--text-muted); }
   .chat__send {
-    width: 36px; height: 36px; align-self: flex-end;
+    width: 34px; height: 34px; flex-shrink: 0;
     border-radius: var(--radius-md); background: var(--accent-blue);
-    color: white; font-size: 16px; display: flex; align-items: center; justify-content: center;
+    color: white; font-size: 15px; display: flex; align-items: center; justify-content: center;
   }
   .chat__send:hover:not(:disabled) { background: #79b8ff; }
   .chat__send:disabled { opacity: 0.4; cursor: not-allowed; }
 
   /* ── Stop button ── */
   .chat__stop {
-    width: 36px; height: 36px; align-self: flex-end;
+    width: 34px; height: 34px; flex-shrink: 0;
     border-radius: var(--radius-md); background: var(--accent-red, #f85149);
     color: white; font-size: 14px; font-weight: bold;
     display: flex; align-items: center; justify-content: center;
@@ -463,4 +693,139 @@
     0%, 100% { box-shadow: 0 0 0 0 rgba(248, 81, 73, 0.4); }
     50% { box-shadow: 0 0 0 6px rgba(248, 81, 73, 0); }
   }
+
+  /* ── Markdown rendered output ── */
+  .chat__msg-body--markdown {
+    white-space: normal; /* override pre-wrap — marked handles line breaks */
+  }
+
+  /* Prose elements */
+  :global(.chat__msg-body--markdown p) {
+    margin: 0 0 8px; line-height: 1.65;
+  }
+  :global(.chat__msg-body--markdown p:last-child) { margin-bottom: 0; }
+  :global(.chat__msg-body--markdown h1),
+  :global(.chat__msg-body--markdown h2),
+  :global(.chat__msg-body--markdown h3),
+  :global(.chat__msg-body--markdown h4) {
+    font-weight: 600; color: var(--text-primary);
+    margin: 14px 0 6px; line-height: 1.3;
+  }
+  :global(.chat__msg-body--markdown h1) { font-size: 16px; }
+  :global(.chat__msg-body--markdown h2) { font-size: 14px; }
+  :global(.chat__msg-body--markdown h3) { font-size: 13px; }
+  :global(.chat__msg-body--markdown h4) { font-size: 12px; }
+  :global(.chat__msg-body--markdown ul),
+  :global(.chat__msg-body--markdown ol) {
+    margin: 6px 0 8px; padding-left: 20px;
+  }
+  :global(.chat__msg-body--markdown li) { margin: 3px 0; line-height: 1.55; }
+  :global(.chat__msg-body--markdown a) {
+    color: var(--accent-blue); text-decoration: underline; text-underline-offset: 2px;
+  }
+  :global(.chat__msg-body--markdown a:hover) { color: #79b8ff; }
+  :global(.chat__msg-body--markdown strong) { font-weight: 600; color: var(--text-primary); }
+  :global(.chat__msg-body--markdown em) { font-style: italic; color: var(--text-secondary); }
+  :global(.chat__msg-body--markdown hr) {
+    border: none; border-top: 1px solid var(--border); margin: 12px 0;
+  }
+  :global(.chat__msg-body--markdown table) {
+    width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0;
+  }
+  :global(.chat__msg-body--markdown th),
+  :global(.chat__msg-body--markdown td) {
+    padding: 5px 10px; border: 1px solid var(--border); text-align: left;
+  }
+  :global(.chat__msg-body--markdown th) {
+    background: var(--bg-tertiary); font-weight: 600; color: var(--text-primary);
+  }
+  :global(.chat__msg-body--markdown tr:nth-child(even) td) {
+    background: rgba(48, 54, 61, 0.3);
+  }
+
+  /* Blockquote */
+  :global(.md-blockquote) {
+    margin: 8px 0; padding: 6px 12px;
+    border-left: 3px solid var(--accent-blue);
+    background: rgba(56, 139, 253, 0.06);
+    color: var(--text-secondary); font-style: italic;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+
+  /* Clickable file paths */
+  :global(.md-file-link) {
+    display: inline;
+    font-family: var(--font-mono); font-size: 12px;
+    padding: 1px 5px; border-radius: var(--radius-sm);
+    background: rgba(88, 166, 255, 0.12);
+    color: #58a6ff;
+    border: 1px solid rgba(88, 166, 255, 0.3);
+    cursor: pointer; text-decoration: none;
+    transition: background 0.15s, border-color 0.15s;
+    vertical-align: baseline; line-height: inherit;
+  }
+  :global(.md-file-link:hover) {
+    background: rgba(88, 166, 255, 0.22);
+    border-color: rgba(88, 166, 255, 0.55);
+    text-decoration: underline;
+  }
+
+  /* Inline code */
+  :global(.md-inline-code) {
+    font-family: var(--font-mono); font-size: 12px;
+    padding: 1px 5px; border-radius: var(--radius-sm);
+    background: rgba(110, 118, 129, 0.2);
+    color: #e3b341; /* amber — stands out against dark bg */
+    border: 1px solid rgba(110, 118, 129, 0.3);
+  }
+
+  /* Fenced code blocks */
+  :global(.md-code-block) {
+    margin: 10px 0; border-radius: var(--radius-md);
+    border: 1px solid var(--border); overflow: hidden;
+    background: #0d1117; /* GitHub dark */
+  }
+  :global(.md-code-header) {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 5px 12px;
+    background: rgba(48, 54, 61, 0.8);
+    border-bottom: 1px solid var(--border);
+  }
+  :global(.md-code-lang) {
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--text-muted); text-transform: lowercase;
+  }
+  :global(.md-copy-btn) {
+    font-size: 11px; padding: 2px 8px;
+    background: rgba(110, 118, 129, 0.2); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); color: var(--text-secondary);
+    cursor: pointer; transition: all 0.15s;
+  }
+  :global(.md-copy-btn:hover) {
+    background: rgba(110, 118, 129, 0.4); color: var(--text-primary);
+  }
+  :global(.md-code-block pre) {
+    margin: 0; padding: 12px 14px; overflow-x: auto;
+    font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  }
+  :global(.md-code-block code) {
+    font-family: inherit; font-size: inherit; background: none; border: none; padding: 0;
+  }
+
+  /* highlight.js — GitHub Dark theme tokens */
+  :global(.hljs) { color: #c9d1d9; background: none; }
+  :global(.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-link) { color: #ff7b72; }
+  :global(.hljs-string, .hljs-attr, .hljs-symbol, .hljs-bullet, .hljs-addition) { color: #a5d6ff; }
+  :global(.hljs-title, .hljs-name, .hljs-type, .hljs-selector-id, .hljs-selector-class, .hljs-built_in) { color: #d2a8ff; }
+  :global(.hljs-comment, .hljs-quote, .hljs-deletion) { color: #8b949e; font-style: italic; }
+  :global(.hljs-number, .hljs-regexp, .hljs-params) { color: #79c0ff; }
+  :global(.hljs-meta) { color: #e3b341; }
+  :global(.hljs-emphasis) { font-style: italic; }
+  :global(.hljs-strong) { font-weight: bold; }
+  :global(.hljs-variable, .hljs-template-variable) { color: #ffa657; }
+  :global(.hljs-subst, .hljs-selector-pseudo, .hljs-selector-attr, .hljs-attribute) { color: #c9d1d9; }
+  :global(.hljs-doctag) { color: #ff7b72; }
+  :global(.hljs-property) { color: #79c0ff; }
+  :global(.hljs-operator) { color: #ff7b72; }
+  :global(.hljs-punctuation) { color: #c9d1d9; }
 </style>

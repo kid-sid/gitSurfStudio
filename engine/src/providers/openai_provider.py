@@ -34,3 +34,18 @@ class OpenAIProvider(LLMProvider):
             kwargs["max_tokens"] = max_tokens
         response = self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content.strip()
+
+    def stream_complete(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: Optional[float] = 0.1,
+    ):
+        """Yields text tokens as they arrive from the OpenAI streaming API."""
+        kwargs: dict = {"model": model, "messages": messages, "stream": True}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        with self.client.chat.completions.create(**kwargs) as stream:
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content

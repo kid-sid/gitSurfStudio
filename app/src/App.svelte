@@ -5,10 +5,13 @@
   import CodeEditor from "./components/CodeEditor.svelte";
   import ChatPanel from "./components/ChatPanel.svelte";
   import StatusBar from "./components/StatusBar.svelte";
-import ForkButton from "./components/ForkButton.svelte";
-import GitPanel from "./components/GitPanel.svelte";
-import SymbolBrowser from "./components/SymbolBrowser.svelte";
-import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./lib/api.js";
+  import ForkButton from "./components/ForkButton.svelte";
+  import GitPanel from "./components/GitPanel.svelte";
+  import SymbolBrowser from "./components/SymbolBrowser.svelte";
+  import AuthPage from "./components/AuthPage.svelte";
+  import TerminalPanel from "./components/TerminalPanel.svelte";
+  import { supabase, saveWorkspace, getRecentWorkspaces, deleteWorkspace } from "./lib/supabase.js";
+  import { initWorkspace, checkHealth } from "./lib/api.js";
 
   let activeFile = $state("");
   let openFiles = $state([]);
@@ -20,6 +23,8 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
   let isGitHubRepo = $state(false);
   let isAuthenticated = $state(false);
   let activeSidebarView = $state("explorer"); // "explorer" or "git"
+  let showTerminal = $state(false);
+  let recentWorkspaces = $state([]);
 
   // Ensure activeFile is always in openFiles
   $effect(() => {
@@ -29,18 +34,58 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
   });
 
   onMount(async () => {
-    // Initial health and auth check
     engineOnline = await checkHealth();
-    const auth = await checkAuthStatus();
-    isAuthenticated = auth.authenticated;
-    
-    // Auto-ping engine
+
+    // Resolve current session on load
+    const { data: { session } } = await supabase.auth.getSession();
+    isAuthenticated = !!session;
+
+    // Keep auth state in sync (handles OAuth redirects, sign-outs, token refresh)
+    supabase.auth.onAuthStateChange((_event, session) => {
+      isAuthenticated = !!session;
+      if (session) getRecentWorkspaces().then(ws => { recentWorkspaces = ws; }).catch(() => {});
+    });
+
+    if (isAuthenticated) {
+      recentWorkspaces = await getRecentWorkspaces().catch(() => []);
+    }
+
+    // Auto-ping engine every 10 s
     setInterval(async () => {
       engineOnline = await checkHealth();
-      const auth = await checkAuthStatus();
-      isAuthenticated = auth.authenticated;
     }, 10000);
+
+    // Ctrl+` — toggle terminal panel
+    window.addEventListener("keydown", (e) => {
+      if (e.ctrlKey && e.code === "Backquote") {
+        e.preventDefault();
+        showTerminal = !showTerminal;
+      }
+    });
+
+    // Cross-file F12 navigation: open file then scroll to line
+    window.addEventListener("navigate-to-file-line", (e) => {
+      const { path, line } = e.detail;
+      if (!openFiles.includes(path)) openFiles = [...openFiles, path];
+      activeFile = path;
+      // Give the editor time to mount/swap the model before scrolling
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent("navigate-to-line", { detail: { path, line } }));
+      }, 150);
+    });
   });
+
+  async function handleSignOut() {
+    await supabase.auth.signOut();
+    recentWorkspaces = [];
+    goHome();
+  }
+
+  async function handleDeleteWorkspace(id, event) {
+    event.stopPropagation();
+    await deleteWorkspace(id);
+    recentWorkspaces = recentWorkspaces.filter(w => w.id !== id);
+  }
 
   async function handleInit() {
     if (!initInput.trim() || isInitializing) return;
@@ -52,6 +97,10 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
       const res = await initWorkspace(initInput.trim());
       workspacePath = res.workspace_path;
       isGitHubRepo = res.is_github;
+      // Persist to workspaces table (fire-and-forget)
+      saveWorkspace(initInput.trim(), res.is_github).then(() =>
+        getRecentWorkspaces().then(ws => { recentWorkspaces = ws; }).catch(() => {})
+      ).catch(() => {});
     } catch (e) {
       initError = e.message;
     } finally {
@@ -78,6 +127,28 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
     if (command === "open_file") {
       const path = args.trim();
       handleFileSelect({ detail: { path } });
+    } else if (command === "file_changed") {
+      const path = args.trim();
+      // Ensure the file is open, then signal CodeEditor to show diff
+      if (!openFiles.includes(path)) {
+        openFiles = [...openFiles, path];
+        activeFile = path;
+      }
+      window.dispatchEvent(new CustomEvent("ai-file-changed", { detail: { path } }));
+    } else if (command === "file_created") {
+      const path = args.trim();
+      if (!openFiles.includes(path)) {
+        openFiles = [...openFiles, path];
+        activeFile = path;
+      }
+      window.dispatchEvent(new CustomEvent("ai-file-created", { detail: { path } }));
+    } else if (command === "ai_writing_start") {
+      const path = args.trim();
+      if (!openFiles.includes(path)) {
+        openFiles = [...openFiles, path];
+        activeFile = path;
+      }
+      window.dispatchEvent(new CustomEvent("ai-writing-start", { detail: { path } }));
     }
   }
 
@@ -91,6 +162,11 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
 </script>
 
 <div class="studio-layout">
+  {#if !isAuthenticated}
+    <!-- Auth gate — shown before anything else -->
+    <AuthPage />
+  {:else}
+
   <!-- Title Bar -->
   <header class="title-bar">
     <div class="title-bar__left">
@@ -104,16 +180,21 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
       <span class="title-bar__file">{activeFile || workspacePath || "Welcome"}</span>
     </div>
     <div class="title-bar__right">
-      <span class="status-bar__item status-bar__engine" class:online={engineOnline}>
-        ● {engineOnline ? "Engine Connected" : "Engine Disconnected"}
+      <span class="engine-badge" class:online={engineOnline}>
+        ● {engineOnline ? "Engine Connected" : "Engine Offline"}
       </span>
       {#if workspacePath}
-        {#if !isAuthenticated}
-          <button class="login-btn" onclick={loginWithGitHub}>🔑 Login with GitHub</button>
-        {:else}
-          <ForkButton {workspacePath} isGitHub={isGitHubRepo} />
-        {/if}
+        <button
+          class="terminal-toggle-btn"
+          class:active={showTerminal}
+          onclick={() => showTerminal = !showTerminal}
+          title="Toggle Terminal (Ctrl+`)"
+        >&gt;_</button>
       {/if}
+      {#if workspacePath && isGitHubRepo}
+        <ForkButton {workspacePath} isGitHub={isGitHubRepo} />
+      {/if}
+      <button class="signout-btn" onclick={handleSignOut} title="Sign Out">Sign Out</button>
     </div>
   </header>
 
@@ -145,6 +226,32 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
         <div class="welcome-footer">
           <span>Tip: You can paste a full GitHub repo link.</span>
         </div>
+
+        {#if recentWorkspaces.length > 0}
+          <div class="recent-workspaces">
+            <p class="recent-title">Recent</p>
+            {#each recentWorkspaces as ws}
+              <div
+                class="recent-item"
+                onclick={() => { initInput = ws.path; handleInit(); }}
+                onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { initInput = ws.path; handleInit(); } }}
+                role="button"
+                tabindex="0"
+              >
+                <span class="recent-icon">{ws.is_github ? "🐙" : "📁"}</span>
+                <div class="recent-info">
+                  <span class="recent-name">{ws.name}</span>
+                  <span class="recent-path">{ws.path}</span>
+                </div>
+                <button
+                  class="recent-delete"
+                  onclick={(e) => handleDeleteWorkspace(ws.id, e)}
+                  title="Remove"
+                >✕</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
       </div>
     </div>
   {:else}
@@ -181,13 +288,27 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
         {/if}
       </aside>
 
-      <main class="editor-area">
-        <CodeEditor 
-          bind:activeFile={activeFile} 
-          bind:openFiles={openFiles} 
-          {workspacePath} 
-        />
-      </main>
+      <div class="editor-column">
+        <main class="editor-area">
+          <CodeEditor
+            bind:activeFile={activeFile}
+            bind:openFiles={openFiles}
+            {workspacePath}
+          />
+        </main>
+        {#if showTerminal}
+          <div class="terminal-area">
+            <div class="terminal-area__header">
+              <span class="terminal-area__title">Terminal</span>
+              <span class="terminal-area__cwd">{workspacePath}</span>
+              <button class="terminal-area__close" onclick={() => showTerminal = false} title="Close Terminal">×</button>
+            </div>
+            <div class="terminal-area__body">
+              <TerminalPanel {workspacePath} bind:isOpen={showTerminal} />
+            </div>
+          </div>
+        {/if}
+      </div>
 
       <aside class="chat-panel">
         <ChatPanel 
@@ -200,6 +321,8 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
   {/if}
 
   <StatusBar currentFile={activeFile} {engineOnline} {workspacePath} />
+
+  {/if} <!-- end auth gate -->
 </div>
 
 <style>
@@ -222,12 +345,22 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
     user-select: none;
     z-index: 100;
   }
-  .title-bar__left { display: flex; align-items: center; gap: 8px; }
-  .title-bar__logo { font-size: 18px; }
-  .title-bar__name { font-weight: 600; font-size: 12px; color: var(--text-secondary); letter-spacing: 0.5px; text-transform: uppercase; }
-  .title-bar__center { font-size: 12px; color: var(--text-secondary); }
-  .title-bar__status { font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm); background: rgba(248, 81, 73, 0.15); color: var(--accent-red); }
-  .title-bar__status.online { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); }
+  .title-bar__left { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .title-bar__logo { font-size: 16px; }
+  .title-bar__name { font-weight: 600; font-size: 11px; color: var(--text-secondary); letter-spacing: 0.5px; text-transform: uppercase; }
+  .title-bar__center {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    gap: 8px; font-size: 12px; color: var(--text-secondary);
+    min-width: 0; overflow: hidden;
+  }
+  .title-bar__file { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 400px; }
+  .title-bar__right { display: flex; align-items: center; gap: 8px; }
+  .engine-badge {
+    font-size: 11px; padding: 3px 10px; border-radius: var(--radius-sm);
+    background: rgba(248, 81, 73, 0.15); color: var(--accent-red);
+    white-space: nowrap;
+  }
+  .engine-badge.online { background: rgba(63, 185, 80, 0.15); color: var(--accent-green); }
 
   /* Welcome Screen */
   .welcome-screen {
@@ -280,7 +413,44 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
   .init-box button:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .init-error { margin-top: 16px; color: var(--accent-red); font-size: 13px; font-weight: 500; }
-  .welcome-footer { margin-top: 40px; font-size: 12px; color: var(--text-muted); opacity: 0.6; }
+  .welcome-footer { margin-top: 24px; font-size: 12px; color: var(--text-muted); opacity: 0.6; }
+
+  /* Recent workspaces */
+  .recent-workspaces {
+    width: 100%; margin-top: 24px;
+    text-align: left;
+  }
+  .recent-title {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.6px; color: var(--text-muted); margin-bottom: 8px;
+  }
+  .recent-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; border-radius: var(--radius-md);
+    border: 1px solid var(--border); background: var(--bg-secondary);
+    cursor: pointer; margin-bottom: 6px;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .recent-item:hover { background: var(--bg-hover); border-color: var(--accent-blue); }
+  .recent-icon { font-size: 16px; flex-shrink: 0; }
+  .recent-info { flex: 1; min-width: 0; }
+  .recent-name {
+    display: block; font-size: 13px; font-weight: 500;
+    color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .recent-path {
+    display: block; font-size: 11px; color: var(--text-muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-family: var(--font-mono);
+  }
+  .recent-delete {
+    background: none; border: none; color: var(--text-muted);
+    font-size: 12px; cursor: pointer; padding: 2px 4px;
+    border-radius: var(--radius-sm); flex-shrink: 0;
+    opacity: 0; transition: opacity 0.15s;
+  }
+  .recent-item:hover .recent-delete { opacity: 1; }
+  .recent-delete:hover { color: var(--accent-red); }
 
   /* Main IDE content styles */
   .main-content { display: flex; flex: 1; overflow: hidden; }
@@ -303,22 +473,92 @@ import { initWorkspace, checkHealth, checkAuthStatus, loginWithGitHub } from "./
   .activity-btn:hover { opacity: 0.8; background: rgba(255,255,255,0.05); }
   .activity-btn.active { opacity: 1; border-left: 2px solid var(--accent-blue); border-radius: 0; }
 
-  .login-btn {
-    background: #238636;
-    color: white;
-    border: none;
-    padding: 4px 12px;
+  .signout-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 3px 10px;
     border-radius: 6px;
     font-size: 11px;
-    font-weight: 600;
+    font-weight: 500;
     cursor: pointer;
-    transition: background 0.2s;
+    transition: all 0.15s;
   }
-  .login-btn:hover { background: #2ea043; }
+  .signout-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+  }
 
   .sidebar { width: 260px; min-width: 200px; background: var(--bg-secondary); border-right: 1px solid var(--border); overflow-y: auto; }
-  .editor-area { flex: 1; min-width: 200px; overflow: hidden; background: var(--bg-primary); }
-  .chat-panel { width: 380px; min-width: 300px; background: var(--bg-secondary); border-left: 1px solid var(--border); overflow: hidden; display: flex; flex-direction: column; }
+  .editor-column { flex: 1; min-width: 200px; display: flex; flex-direction: column; overflow: hidden; }
+  .editor-area { flex: 1; min-width: 0; overflow: hidden; background: var(--bg-primary); }
+  .chat-panel { width: 480px; min-width: 360px; background: var(--bg-secondary); border-left: 1px solid var(--border); overflow: hidden; display: flex; flex-direction: column; }
+
+  /* Terminal panel */
+  .terminal-area {
+    flex-shrink: 0;
+    height: 260px;
+    border-top: 1px solid var(--border);
+    background: #0d1117;
+    display: flex;
+    flex-direction: column;
+  }
+  .terminal-area__header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 30px;
+    padding: 0 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .terminal-area__title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .terminal-area__cwd {
+    flex: 1;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .terminal-area__close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 2px 4px;
+    line-height: 1;
+    border-radius: 3px;
+    transition: color 0.15s;
+  }
+  .terminal-area__close:hover { color: var(--text-primary); }
+  .terminal-area__body { flex: 1; overflow: hidden; }
+
+  /* Terminal toggle button */
+  .terminal-toggle-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .terminal-toggle-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .terminal-toggle-btn.active { background: rgba(88,166,255,0.15); color: var(--accent-blue); border-color: var(--accent-blue); }
 
   .home-btn {
     background: var(--bg-tertiary);

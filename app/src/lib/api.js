@@ -87,7 +87,7 @@ const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
  * @param {Function} onCommand - Callback for UI commands (e.g. open_file)
  * @param {AbortSignal} signal - Optional AbortSignal to cancel the request
  */
-export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal) {
+export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal, userId = null) {
   // Always enforce a 5-minute timeout; combine with caller's abort signal when provided
   const timeoutSignal = AbortSignal.timeout(CHAT_TIMEOUT_MS);
   const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -95,7 +95,7 @@ export async function sendChat(query, path, history = [], onLog, onAnswer, onCom
   const response = await fetch(`${ENGINE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, path, history }),
+    body: JSON.stringify({ query, path, history, user_id: userId }),
     signal: combinedSignal,
   });
 
@@ -123,7 +123,12 @@ export async function sendChat(query, path, history = [], onLog, onAnswer, onCom
           onLog(data.content);
         } else if (data.type === "ui_command" && onCommand) {
           onCommand(data.command, data.args);
+        } else if (data.type === "answer_token") {
+          // Streaming token — accumulate and notify progressively
+          fullAnswer += data.content;
+          if (onAnswer) onAnswer(fullAnswer);
         } else if (data.type === "answer") {
+          // Non-streaming fallback (mock provider) — deliver all at once
           fullAnswer += data.content;
           if (onAnswer) onAnswer(fullAnswer);
         }
@@ -287,6 +292,99 @@ export async function gitDiscard(path, file) {
     throw new Error(error.detail || "Failed to discard changes");
   }
   return await response.json();
+}
+
+/**
+ * Deletes the .bak backup file after accept or reject
+ * @param {string} path - Absolute path to the original file
+ */
+export async function cleanupBackup(path) {
+  const response = await fetch(`${ENGINE_URL}/cleanup-backup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to cleanup backup");
+  }
+  return await response.json();
+}
+
+/**
+ * Restores a file from its .bak backup (created before AI edits)
+ * @param {string} path - Absolute path to the file
+ */
+export async function restoreFile(path) {
+  const response = await fetch(`${ENGINE_URL}/restore`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to restore file");
+  }
+  return await response.json();
+}
+
+/**
+ * Deletes a newly AI-created file when the user rejects it
+ * @param {string} path - Absolute path to the file
+ */
+export async function deleteFile(path) {
+  const response = await fetch(`${ENGINE_URL}/delete-file`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to delete file");
+  }
+  return await response.json();
+}
+
+/**
+ * Gets an inline code completion from the LLM
+ * @param {string} path - File URI or path (for context)
+ * @param {string} prefix - Code before cursor
+ * @param {string} suffix - Code after cursor
+ * @param {string} language - Language ID
+ */
+export async function getCompletion(path, prefix, suffix, language = "plaintext") {
+  const response = await fetch(`${ENGINE_URL}/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, prefix, suffix, language }),
+  });
+  if (!response.ok) return null;
+  return await response.json();
+}
+
+/**
+ * Peeks the definition of a symbol by name (F12 / Go to Definition)
+ * @param {string} name - Symbol name (function, class, method)
+ * @returns {{ symbol: string, results: Array<{file,type,name,start_line,end_line,content}> }}
+ */
+export async function peekSymbol(name) {
+  const response = await fetch(`${ENGINE_URL}/peek-symbol?name=${encodeURIComponent(name)}`);
+  if (!response.ok) return { symbol: name, results: [] };
+  return await response.json();
+}
+
+/**
+ * Returns added/modified line numbers vs HEAD for a file (for gutter decorations)
+ * @param {string} path - Absolute path to the file
+ */
+export async function getGitDiffLines(path) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/git/diff-lines?path=${encodeURIComponent(path)}`);
+    if (!response.ok) return { added: [], modified: [] };
+    return await response.json();
+  } catch {
+    return { added: [], modified: [] };
+  }
 }
 
 /**

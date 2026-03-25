@@ -7,9 +7,69 @@ Orchestrator: Coordinates pipelines and the shared ReAct action loop.
 """
 
 import os
+import re
 import json
 from typing import List, Dict, Optional
 
+# ── Tier-0 fast-path: overview / context questions ─────────────────────────────
+# Questions that can be answered by reading README + project docs directly —
+# no search pipeline, no embeddings, no ripgrep needed.
+_OVERVIEW_PATTERNS = [
+    # What is / what does
+    r'\bwhat\s+does\s+(this|the)?\s*(project|codebase|repo|code|app)\s+(do|mean|contain|provide)\b',
+    r'\bwhat\s+is\s+(this|the)\s*(project|codebase|repo|code|app)\b',
+    # Explain / describe / summarize
+    r'\b(explain|describe|summarize?|overview\s+of|purpose\s+of)\b.{0,60}\b(project|codebase|repo|code|app|architecture)\b',
+    r'\b(explain|describe)\s+(the\s+)?(main\s+)?(architecture|structure|design|overview|features?)\b',
+    # Project overview
+    r'\b(project|codebase|repo|app)\s+(overview|summary|purpose|goal)\b',
+    r'\btell\s+me\s+about\s+(this\s+)?(project|codebase|repo|app)\b',
+    r'\bhow\s+does\s+(this\s+)?(project|app|code|tool)\s+work\b',
+    r'\bwhat\s+can\s+(this|the)\s+(app|project|tool)\s+do\b',
+    r'\bmain\s+(purpose|goal|objective|functionality|feature)\b',
+    r'\barchitecture\s+of\s+(this|the)\s*(project|code|app|system)\b',
+    # How to run / start / install / setup / use
+    r'\bhow\s+(to|do\s+i|can\s+i)\s+(run|start|launch|execute|install|setup|set\s+up|use|get\s+started|deploy|build)\b',
+    r'\b(steps?|instructions?|guide|way)\s+(to|for)\s+(run|start|install|setup|use|deploy|build)\b',
+    r'\bhow\s+do\s+i\s+(get\s+started|run\s+it|install|set\s+this\s+up)\b',
+    r'\b(run|start|install|setup|launch)\s+(this\s+)?(project|app|code|repo|locally)\b',
+    r'\brun\s+(the\s+)?(project|app|code|server)\s+(locally|now)?\b',
+    r'\bget\s+(this\s+)?(running|started|working)\b',
+    # Short / vague
+    r'^\s*(what is this|what does this do|explain this|overview|how to run|how to use|getting started)\s*\??$',
+]
+_OVERVIEW_RE = [re.compile(p, re.IGNORECASE) for p in _OVERVIEW_PATTERNS]
+
+# Files read for overview questions — ordered by priority
+_OVERVIEW_FILES = [
+    'README.md', 'README.rst', 'README.txt', 'README',
+    'CLAUDE.md', 'ARCHITECTURE.md', 'OVERVIEW.md', 'DESIGN.md', 'CONTRIBUTING.md',
+    'package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml', 'setup.py',
+]
+
+
+def _is_overview_question(question: str) -> bool:
+    return any(p.search(question.strip()) for p in _OVERVIEW_RE)
+
+
+def _read_overview_files(search_path: str, max_chars: int = 6000) -> str:
+    """Read README and project config files directly — no indexing needed."""
+    parts = []
+    for fname in _OVERVIEW_FILES:
+        fpath = os.path.join(search_path, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read(max_chars)
+            parts.append(f"### {fname}\n{content}")
+            if sum(len(p) for p in parts) >= max_chars * 2:
+                break
+        except Exception:
+            pass
+    return "\n\n---\n\n".join(parts)
+
+from src.guardrails import validate_answer, validate_action
 from src.tools.search_tool import SearchTool
 from src.tools.vector_search_tool import VectorSearchTool
 from src.tools.bm25_search_tool import BM25SearchTool
@@ -187,12 +247,20 @@ def execute_action_loop(
             max_iterations=max_iterations,
         )
 
+        # Validate action JSON schema (fixes malformed dicts in-place)
+        decision, action_warnings = validate_action(decision)
+        for w in action_warnings:
+            print(f"   [ActionGuard] {w}")
+
         action_type = decision.get("action")
         thought = decision.get("thought", "No thought provided.")
         print(f"   Thought: {thought}")
 
         if action_type == "final_answer":
-            answer = decision.get("content", "No content provided.")
+            # Stream the answer token-by-token via stdout ([ANSWER_TOKEN] prefix)
+            answer = llm.stream_final_answer(
+                question, context_for_llm, history=history
+            )
             break
 
         elif action_type == "tool_call":
@@ -234,6 +302,12 @@ def execute_action_loop(
 
     if answer is None:
         answer = "Error: Agent reached maximum iterations without giving a final answer."
+
+    # Validate final answer — redact secrets/PII, append safety notices
+    answer, answer_warnings = validate_answer(answer)
+    for w in answer_warnings:
+        print(f"   [AnswerGuard] {w}")
+
     return answer
 
 
@@ -534,6 +608,34 @@ def run_local_pipeline(
     """
     print("\n[Smart Local Pipeline]")
 
+    # ── Tier-0: Overview fast-path ────────────────────────────────────────────
+    # For "what does this project do?" style questions: read README + config
+    # files directly and answer in a single LLM call. Skip all search steps.
+    if _is_overview_question(question):
+        print("[Tier-0] Overview question detected — reading project docs directly...")
+        project_structure = build_local_file_tree(search_path)
+        overview_docs = _read_overview_files(search_path)
+        if overview_docs:
+            context_parts = []
+            if project_context:
+                context_parts.append(f"Project Summary:\n{project_context}")
+            context_parts.append(f"File Structure:\n{project_structure[:1500]}")
+            context_parts.append(overview_docs)
+            initial_context = "\n\n---\n\n".join(context_parts)
+            print(f"   [Tier-0] Using {len(initial_context)} chars from project docs. Answering directly.")
+            answer = execute_action_loop(
+                question=question,
+                initial_context=initial_context,
+                llm=llm,
+                tools=tools,
+                available_tools=available_tools,
+                project_structure=project_structure,
+                history=history,
+                max_iterations=1,   # answer immediately — no tool calls needed
+            )
+            return answer, initial_context
+        print("   [Tier-0] No README or project docs found. Falling through to full pipeline.")
+
     # Step 1: Build local file tree
     print("[Step 1/6] Building local file tree...")
     project_structure = build_local_file_tree(search_path)
@@ -548,9 +650,36 @@ def run_local_pipeline(
     query_to_use = refined_data.get("refined_question", question)
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
+    is_overview_question = refined_data.get("is_overview_question", False)
     direct_tool_call = refined_data.get("direct_tool_call")
     print(f"   Refined to: \"{query_to_use}\"")
     print(f"   Keywords: {expansion_keywords[:5]}")
+
+    # ── Tier-1: LLM-classified overview fast-path ─────────────────────────────
+    # Catches vague phrasings the regex didn't detect (e.g. "what does it do?",
+    # "hm, explain this", "give me a summary", "any idea what this is?")
+    if is_overview_question:
+        print("   [Tier-1] LLM classified as overview question. Reading project docs...")
+        overview_docs = _read_overview_files(search_path)
+        if overview_docs:
+            context_parts = []
+            if project_context:
+                context_parts.append(f"Project Summary:\n{project_context}")
+            context_parts.append(f"File Structure:\n{project_structure[:1500]}")
+            context_parts.append(overview_docs)
+            initial_context = "\n\n---\n\n".join(context_parts)
+            answer = execute_action_loop(
+                question=question,
+                initial_context=initial_context,
+                llm=llm,
+                tools=tools,
+                available_tools=available_tools,
+                project_structure=project_structure,
+                history=history,
+                max_iterations=1,
+            )
+            return answer, initial_context
+        print("   [Tier-1] No project docs found. Falling through to full pipeline.")
 
     if direct_tool_call:
         print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")
