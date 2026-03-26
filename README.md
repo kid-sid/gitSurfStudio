@@ -2,18 +2,21 @@
 
 **The blazing-fast, lightweight AI-powered IDE for autonomous codebase evolution.**
 
-GitSurf Studio transforms the power of the GitSurf AI engine into a professional, native desktop experience. Built with a focus on speed, efficiency, and deep codebase reasoning, it allows you to explore any local folder or GitHub repository with a persistent AI assistant.
+GitSurf Studio transforms the power of the GitSurf AI engine into a professional, native desktop experience. Built with a focus on speed, efficiency, and deep codebase reasoning, it allows you to explore any local folder or GitHub repository with a persistent AI assistant that can read, edit, search, browse the web, and reason across external tools.
 
 ---
 
 ## ✨ Key Features
 
 - 🚀 **Zero Cold-Start AI**: Persistent FastAPI daemon keeps models and search indexes ready in RAM for instant responses.
-- 🤖 **Upgraded PRAR Engine**: A "Perceive-Reason-Act-Reflect" agent with enhanced prompt engineering for precise tool usage and target file prediction.
-- 📂 **Multi-Tab Support**: Seamlessly switch between multiple files with a modern VS Code-inspired tabbed interface.
-- 🛡️ **Safe File Editing**: Robust `replace_in_file` tool with occurrence validation and automatic `.bak` backups to prevent accidental code loss.
-- 🧩 **Global Project Context**: Automatic README analysis during initialization to ground AI reasoning in your project's specific jargon and architecture.
+- 🤖 **PRAR Agent Engine**: A "Perceive-Reason-Act-Reflect" loop with up to 8 reasoning iterations, precise tool routing, and target file prediction.
+- 🔌 **MCP Tool Integration**: Native Model Context Protocol client — connects to Playwright (browser automation), Context7 (live library docs), and Sequential Thinking (structured reasoning) out of the box. Extensible via `engine/mcp_config.json`.
+- 📂 **Multi-Tab Editor**: Monaco Editor with syntax highlighting, inline completions, real-time linting (ruff / eslint), and git gutter indicators.
+- 🛡️ **Safe File Editing**: `replace_in_file` with occurrence validation and automatic `.bak` backups; AI diffs shown with Keep/Reject UI.
+- 🧩 **Persistent Chat Memory**: Multi-session conversation history per repo stored in Supabase with rolling LLM summarization.
 - 🐚 **Ultra-Lightweight Frontend**: Built with **Tauri** and **Svelte 5** (Runes) for a native feel with minimal memory footprint.
+- 🔍 **Symbol Navigation**: F12 Go-to-Definition across Python, JS/TS, and C-family files.
+- 🖥️ **Integrated Terminal**: xterm.js terminal panel (Ctrl+`) scoped to workspace root.
 
 ---
 
@@ -23,15 +26,25 @@ GitSurf Studio follows a **Thin Client, Smart Backend** monorepo structure:
 
 ```text
 gitSurfStudio/
-├── engine/              # Python AI Backend (FastAPI + PRAR Pipeline)
-│   ├── src/             # Core logic: orchestrator, llm_client, tools
-│   ├── .cache/          # Cloned GitHub repositories
-│   ├── server.py        # The AI daemon (REST + JSON Streaming)
-│   └── .env             # API Configuration (OpenAI, GitHub)
+├── engine/                  # Python AI Backend (FastAPI + PRAR Pipeline)
+│   ├── src/
+│   │   ├── orchestrator.py  # PRAR pipeline + ReAct action loop
+│   │   ├── llm_client.py    # Dual-model LLM abstraction (gpt-4o / gpt-4o-mini)
+│   │   ├── prompts.py       # All prompt templates + MCP routing rules
+│   │   ├── tools/           # FileEditorTool, GitTool, SearchTool, LintTool, etc.
+│   │   ├── mcp/             # MCP client: MCPClientManager + MCPToolProxy
+│   │   └── memory/          # Supabase-backed symbol cache + chat sessions
+│   ├── mcp_config.json      # MCP server declarations (Playwright, Context7, Sequential Thinking)
+│   ├── server.py            # FastAPI server + tool registry + MCP background init
+│   └── .env                 # API keys (OpenAI, GitHub, Supabase, Tavily)
 │
-└── app/                 # Native Desktop Frontend
-    ├── src/             # Svelte 5 UI (App, FileTree, ChatPanel, Editor)
-    └── src-tauri/       # Rust native shell & Sidecar configuration
+└── app/                     # Native Desktop Frontend
+    ├── src/
+    │   ├── App.svelte        # Root layout + workspace init + MCP status polling
+    │   ├── lib/api.js        # All engine API calls
+    │   ├── lib/supabase.js   # Auth + workspace persistence
+    │   └── components/       # ChatPanel, CodeEditor, FileTree, GitPanel, StatusBar, Terminal
+    └── src-tauri/            # Rust native shell
 ```
 
 ---
@@ -40,32 +53,33 @@ gitSurfStudio/
 
 ### 1. Prerequisites
 - **Python 3.10+** (for the AI Engine)
-- **Node.js 18+** (for the Frontend)
+- **Node.js 18+** (for the Frontend and MCP servers)
 - **Rust** (for Tauri native build)
+- **npx** available in PATH (for MCP servers — included with Node.js)
 
 ### 2. Configure the Engine
-Navigate to the `engine` directory and set up your environment:
-```powershell
+```bash
 cd engine
 pip install -r requirements.txt
-# Create a .env file with your keys:
-# OPENAI_API_KEY=sk-...
-# GITHUB_TOKEN=github_pat_...
+cp ../.env.example .env
+# Edit .env — minimum required: OPENAI_API_KEY
 ```
 
 ### 3. Launch GitSurf Studio
 In one terminal, start the AI Engine:
-```powershell
+```bash
 cd engine
-uvicorn server:app --host 127.0.0.1 --port 8002
+uvicorn server:app --host 127.0.0.1 --port 8002 --reload
 ```
 
 In another terminal, launch the Desktop App:
-```powershell
+```bash
 cd app
 npm install
 npm run tauri dev
 ```
+
+The MCP servers (Playwright, Context7, Sequential Thinking) start automatically in the background after the first workspace is opened. Watch the status bar for `MCP ready (N tools)`.
 
 ### 4. 🐳 Run with Docker (Recommended)
 
@@ -73,39 +87,23 @@ npm run tauri dev
 
 On **Windows (PowerShell):**
 ```powershell
-# 1. Create your .env from the template
 Copy-Item .env.example .env
-
-# 2. Open and fill in your real API keys (at minimum: OPENAI_API_KEY)
-notepad .env
-
-# 3. Build and start
+notepad .env          # add OPENAI_API_KEY at minimum
 docker compose up --build
 ```
 
 On **Mac / Linux:**
 ```bash
 cp .env.example .env
-nano .env   # add your real OPENAI_API_KEY
+nano .env
 docker compose up --build
 ```
 
-**Day-to-day (images already built):**
-```powershell
+**Day-to-day:**
+```bash
 docker compose up
 docker compose down
-docker compose restart
-```
-
-**Rebuild only the backend** (e.g. after a dependency change):
-```powershell
-docker compose up --build backend
-```
-
-**View live logs:**
-```powershell
 docker compose logs -f backend
-docker compose logs -f frontend
 ```
 
 | Service | URL |
@@ -113,15 +111,47 @@ docker compose logs -f frontend
 | 🌐 Frontend (Svelte UI) | http://localhost |
 | ⚙️ Backend (AI Engine) | http://localhost:8002 |
 | ❤️ Health check | http://localhost:8002/health |
+| 🔌 MCP status | http://localhost:8002/mcp/status |
 
-> **Minimum required:** Only `OPENAI_API_KEY` is needed to start. `GITHUB_TOKEN`, `GITHUB_CLIENT_ID/SECRET`, and `TAVILY_API_KEY` are optional.
+---
+
+## 🔌 MCP Tools
+
+The agent automatically routes to external MCP tools when appropriate:
+
+| Tool | Triggers when… |
+|------|---------------|
+| **Context7** | Asking about library/framework APIs or syntax (e.g. "how does $state work in Svelte 5?") |
+| **Playwright** | Navigating URLs, taking screenshots, scraping JS-rendered pages, UI testing |
+| **Sequential Thinking** | Planning multi-file refactors, debugging across files, architecture design |
+
+To add more MCP servers, edit `engine/mcp_config.json` — no code changes needed.
+
+---
+
+## 🛠️ Environment Variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | Yes | LLM reasoning (gpt-4o / gpt-4o-mini) |
+| `GITHUB_TOKEN` | No | Repo cloning & git operations |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | No | GitHub OAuth flow |
+| `TAVILY_API_KEY` | No | Web search tool |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | No | Persistent chat memory & symbol cache |
+| `EMBEDDING_PROVIDER=openai` | No | Use OpenAI embeddings instead of local sentence-transformers |
 
 ---
 
 ## 🛠️ Technology Stack
-- **Frontend**: [Svelte 5](https://svelte.dev/) (Runes), [Tauri](https://tauri.app/), [Vite](https://vitejs.dev/)
-- **Backend**: [FastAPI](https://fastapi.tiangolo.com/), [Uvicorn](https://www.uvicorn.org/)
-- **AI Core**: [OpenAI GPT-4o](https://openai.com/), [Ripgrep](https://github.com/BurntSushi/ripgrep), [BM25/FAISS](https://github.com/facebookresearch/faiss)
+
+| Layer | Technology |
+|---|---|
+| Frontend | Svelte 5 (Runes), Tauri, Monaco Editor, xterm.js |
+| Backend | FastAPI, Uvicorn, Python 3.10+ |
+| AI Core | OpenAI gpt-4o / gpt-4o-mini |
+| Search | FAISS, BM25, Ripgrep (hybrid + RRF merge) |
+| MCP | Playwright, Context7, Sequential Thinking (via `mcp` SDK) |
+| Persistence | Supabase (chat sessions, symbol graphs, workspaces) |
 
 ## 📄 License
 MIT License. Built with 🌊 by Sidhartha.

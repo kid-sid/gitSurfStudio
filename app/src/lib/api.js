@@ -64,6 +64,58 @@ export async function writeFile(path, content) {
 }
 
 /**
+ * Creates a directory
+ * @param {string} path - Relative or absolute path
+ */
+export async function createDirectory(path) {
+  const response = await fetch(`${ENGINE_URL}/mkdir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to create directory");
+  }
+  return await response.json();
+}
+
+/**
+ * Renames (moves) a file or directory
+ * @param {string} oldPath - Current relative or absolute path
+ * @param {string} newPath - Desired relative or absolute path
+ */
+export async function renameEntry(oldPath, newPath) {
+  const response = await fetch(`${ENGINE_URL}/rename`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ old_path: oldPath, new_path: newPath }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to rename");
+  }
+  return await response.json();
+}
+
+/**
+ * Recursively deletes a directory
+ * @param {string} path - Directory path
+ */
+export async function deleteDirectory(path) {
+  const response = await fetch(`${ENGINE_URL}/delete-dir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to delete directory");
+  }
+  return await response.json();
+}
+
+/**
  * Checks if the engine is online
  */
 export async function checkHealth() {
@@ -88,7 +140,7 @@ const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
  * @param {Function} onCommand - Callback for UI commands (e.g. open_file)
  * @param {AbortSignal} signal - Optional AbortSignal to cancel the request
  */
-export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal, userId = null) {
+export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal, userId = null, agentMode = false) {
   // Always enforce a 5-minute timeout; combine with caller's abort signal when provided
   const timeoutSignal = AbortSignal.timeout(CHAT_TIMEOUT_MS);
   const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -96,7 +148,7 @@ export async function sendChat(query, path, history = [], onLog, onAnswer, onCom
   const response = await fetch(`${ENGINE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, path, history, user_id: userId }),
+    body: JSON.stringify({ query, path, history, user_id: userId, agent_mode: agentMode }),
     signal: combinedSignal,
   });
 
@@ -484,8 +536,77 @@ export async function lintCode(filePath, content, workspace = "") {
 export async function getSymbols(path, workspace) {
   let url = `${ENGINE_URL}/symbols?path=${encodeURIComponent(path)}`;
   if (workspace) url += `&workspace=${encodeURIComponent(workspace)}`;
-  
+
   const response = await fetch(url);
   if (!response.ok) throw new Error("Failed to fetch symbols");
+  return await response.json();
+}
+
+
+// ── Agent API ─────────────────────────────────────────────────────────────
+
+/**
+ * Rollback agent changes — all files or a single file
+ * @param {string} changesetId - The changeset to rollback
+ * @param {string|null} filePath - Optional specific file to rollback
+ */
+export async function agentRollback(changesetId, filePath = null) {
+  const response = await fetch(`${ENGINE_URL}/agent/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ changeset_id: changesetId, file_path: filePath }),
+  });
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.detail || "Rollback failed");
+  }
+  return await response.json();
+}
+
+/**
+ * Accept agent changes — clean up backups
+ * @param {string} changesetId - The changeset to accept
+ */
+export async function agentAccept(changesetId) {
+  const response = await fetch(`${ENGINE_URL}/agent/accept`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ changeset_id: changesetId }),
+  });
+  if (!response.ok) throw new Error("Accept failed");
+  return await response.json();
+}
+
+/**
+ * Cancel the currently running agent task
+ */
+export async function agentCancel() {
+  const response = await fetch(`${ENGINE_URL}/agent/cancel`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error("Cancel failed");
+  return await response.json();
+}
+
+/**
+ * Send a user response to a paused agent (human-in-the-loop)
+ * @param {string} userResponse - The user's answer
+ */
+export async function agentRespond(userResponse) {
+  const response = await fetch(`${ENGINE_URL}/agent/respond`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ response: userResponse }),
+  });
+  if (!response.ok) throw new Error("Respond failed");
+  return await response.json();
+}
+
+/**
+ * List all active changesets
+ */
+export async function listChangesets() {
+  const response = await fetch(`${ENGINE_URL}/agent/changesets`);
+  if (!response.ok) throw new Error("Failed to list changesets");
   return await response.json();
 }

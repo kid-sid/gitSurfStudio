@@ -1,6 +1,8 @@
 <script>
   import { onMount, onDestroy } from "svelte";
-  import { sendChat, checkHealth, readFile, getFileTree, getChatSessions, createChatSession, loadSessionMessages, deleteChatSession } from "../lib/api.js";
+  import { sendChat, checkHealth, readFile, getFileTree, getChatSessions, createChatSession, loadSessionMessages, deleteChatSession, agentCancel, agentRespond } from "../lib/api.js";
+  import AgentProgress from "./AgentProgress.svelte";
+  import ChangeReview from "./ChangeReview.svelte";
   import { supabase } from "../lib/supabase.js";
   import { renderMarkdown } from "../lib/markdown.js";
 
@@ -20,6 +22,13 @@
   let chatContainer;
   let textareaEl;                     // bound textarea element
   let abortController = null;
+
+  // ── Agent mode state ──────────────────────────────────────────────────────
+  let agentMode = $state(false);
+  let agentPlan = $state(null);        // current plan from agent
+  let agentChangeset = $state(null);   // changeset from completed agent task
+  let agentAskPayload = $state(null);  // {question, options} when agent pauses
+  let agentRunning = $state(false);
 
   // ── Session management ───────────────────────────────────────────────────────
   let sessions = $state([]);          // list of sessions for current repo
@@ -217,7 +226,11 @@
     lastQuery = rawQuery;
     messages.push({ role: "user", content: rawQuery });
     isLoading = true;
-    statusText = "🚀 Starting...";
+    statusText = agentMode ? "🤖 Agent planning..." : "🚀 Starting...";
+    agentPlan = null;
+    agentChangeset = null;
+    agentAskPayload = null;
+    agentRunning = agentMode;
 
     // Resolve @mentions — inject file content into query sent to AI
     const resolvedQuery = await resolveAtMentions(rawQuery);
@@ -242,6 +255,46 @@
     try {
       let answer = "";
       const { data: { user } } = await supabase.auth.getUser();
+      // Wrap oncommand to intercept agent-specific UI commands
+      const handleCommand = (cmd, args) => {
+        if (cmd === 'agent_plan') {
+          try { agentPlan = JSON.parse(args); } catch {}
+          statusText = "🤖 Executing plan...";
+          return;
+        }
+        if (cmd === 'agent_step') {
+          try {
+            const stepData = JSON.parse(args);
+            if (agentPlan?.steps) {
+              const step = agentPlan.steps.find(s => s.id === stepData.step_id);
+              if (step) {
+                step.status = stepData.status;
+                if (stepData.error) step.error = stepData.error;
+                agentPlan = { ...agentPlan }; // trigger reactivity
+              }
+            }
+            if (stepData.status === 'running') {
+              statusText = `🤖 Step ${stepData.step_id}: ${stepData.description || 'Executing...'}`;
+            }
+          } catch {}
+          return;
+        }
+        if (cmd === 'agent_changeset') {
+          try { agentChangeset = JSON.parse(args); } catch {}
+          return;
+        }
+        if (cmd === 'agent_ask') {
+          try { agentAskPayload = JSON.parse(args); } catch {}
+          return;
+        }
+        if (cmd === 'agent_terminal_output') {
+          messages[msgIndex].thoughts = [...messages[msgIndex].thoughts, `$ ${args}`];
+          return;
+        }
+        // Pass through to parent handler for file_changed, open_file, etc.
+        if (oncommand) oncommand(cmd, args);
+      };
+
       await sendChat(
         resolvedQuery,
         workspacePath || ".",
@@ -264,6 +317,8 @@
             statusText = "🧮 Computing embeddings...";
           else if (logLine.includes("[Action Loop]") || logLine.includes("Iteration"))
             statusText = "🧠 Reasoning...";
+          else if (logLine.includes("[Agent Pipeline]") || logLine.includes("[Agent"))
+            statusText = "🤖 " + logLine.split("] ").pop();
           else if (logLine.includes("[Fast-Path]"))
             statusText = "⚡ Fast-Path executing...";
           else if (logLine.includes("[Smart-Route]"))
@@ -278,9 +333,10 @@
           messages[msgIndex].isStreaming = true;
           setTimeout(scrollToBottom, 20);
         },
-        oncommand,
+        handleCommand,
         abortController.signal,
-        user?.id ?? null
+        user?.id ?? null,
+        agentMode
       );
       messages[msgIndex].content = answer;
       messages[msgIndex].isStreaming = false;
@@ -310,9 +366,13 @@
       }
     }
 
-    messages[msgIndex].thinking = false;
-    messages[msgIndex].isStreaming = false;
+    // Guard: messages[] may have been cleared while this request was in-flight
+    if (messages[msgIndex]) {
+      messages[msgIndex].thinking = false;
+      messages[msgIndex].isStreaming = false;
+    }
     isLoading = false;
+    agentRunning = false;
     abortController = null;
     setTimeout(scrollToBottom, 50);
   }
@@ -371,8 +431,10 @@
   }
 
   function clearChat() {
+    if (abortController) abortController.abort();
     messages = [];
     visibleCount = VISIBLE_LIMIT;
+    isLoading = false;
   }
 
   function loadEarlier() {
@@ -396,6 +458,14 @@
       {/if}
     </div>
     <div class="chat__header-right">
+      <button
+        class="chat__mode-toggle"
+        class:chat__mode-active={agentMode}
+        onclick={() => agentMode = !agentMode}
+        title={agentMode ? "Agent Mode: ON (Plan → Execute → Verify)" : "Chat Mode (Q&A)"}
+      >
+        {agentMode ? "🤖 Agent" : "💬 Chat"}
+      </button>
       <button class="chat__new" onclick={handleNewChat} title="New Chat">＋</button>
       <button class="chat__clear" onclick={clearChat} title="Clear view (doesn't delete history)">🗑️</button>
     </div>
@@ -492,6 +562,38 @@
           </div>
         {/if}
 
+        <!-- Agent Progress (shown in agent mode during execution) -->
+        {#if msg.role === "assistant" && agentPlan}
+          <AgentProgress plan={agentPlan} isRunning={agentRunning} onCancel={() => { agentRunning = false; }} />
+        {/if}
+
+        <!-- Agent Ask (human-in-the-loop) -->
+        {#if msg.role === "assistant" && agentAskPayload && msg.thinking}
+          <div class="chat__agent-ask">
+            <div class="chat__agent-ask-question">{agentAskPayload.question}</div>
+            {#if agentAskPayload.options}
+              <div class="chat__agent-ask-options">
+                {#each agentAskPayload.options as option}
+                  <button class="chat__agent-ask-btn" onclick={async () => {
+                    await agentRespond(option);
+                    agentAskPayload = null;
+                  }}>{option}</button>
+                {/each}
+              </div>
+            {:else}
+              <div class="chat__agent-ask-input">
+                <input type="text" placeholder="Type your response..."
+                  onkeydown={async (e) => {
+                    if (e.key === 'Enter') {
+                      await agentRespond(e.target.value);
+                      agentAskPayload = null;
+                    }
+                  }} />
+              </div>
+            {/if}
+          </div>
+        {/if}
+
         <!-- Loading indicator (only while still thinking and no answer yet) -->
         {#if msg.thinking && !msg.content}
           <div class="chat__loading">
@@ -523,6 +625,14 @@
       </div>
     {/each}
   </div>
+
+  <!-- Agent Change Review (shown after agent task completes with changes) -->
+  {#if agentChangeset}
+    <ChangeReview changeset={agentChangeset}
+      onAccepted={() => { agentChangeset = null; }}
+      onRolledBack={() => { agentChangeset = null; }}
+    />
+  {/if}
 
   <div class="chat__input-area">
     <!-- @mention dropdown -->
@@ -561,7 +671,7 @@
         ■
       </button>
     {:else}
-      <button class="chat__send" onclick={handleSend} disabled={!inputText.trim()}>
+      <button class="chat__send" onclick={() => handleSend()} disabled={!inputText.trim()}>
         ➤
       </button>
     {/if}
@@ -596,6 +706,59 @@
     border-radius: var(--radius-sm); opacity: 0.5;
   }
   .chat__clear:hover { opacity: 1; background: var(--bg-hover); }
+
+  .chat__mode-toggle {
+    font-size: 11px; padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary, #313244);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .chat__mode-toggle:hover { background: var(--bg-hover); }
+  .chat__mode-active {
+    background: var(--accent, #89b4fa) !important;
+    color: var(--bg-primary, #1e1e2e) !important;
+    border-color: var(--accent, #89b4fa) !important;
+  }
+
+  .chat__agent-ask {
+    background: var(--bg-tertiary, #313244);
+    border: 1px solid var(--accent, #89b4fa);
+    border-radius: 6px; padding: 10px 12px;
+    margin: 6px 0;
+  }
+  .chat__agent-ask-question {
+    font-size: 12px; color: var(--text-primary);
+    margin-bottom: 8px;
+  }
+  .chat__agent-ask-options {
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
+  .chat__agent-ask-btn {
+    font-size: 11px; padding: 4px 12px;
+    border-radius: 4px;
+    border: 1px solid var(--accent, #89b4fa);
+    background: transparent;
+    color: var(--accent, #89b4fa);
+    cursor: pointer;
+  }
+  .chat__agent-ask-btn:hover {
+    background: var(--accent, #89b4fa);
+    color: var(--bg-primary, #1e1e2e);
+  }
+  .chat__agent-ask-input input {
+    width: 100%; padding: 6px 10px;
+    font-size: 12px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    outline: none;
+  }
+  .chat__agent-ask-input input:focus {
+    border-color: var(--accent, #89b4fa);
+  }
 
   .chat__session-list {
     border-bottom: 1px solid var(--border); background: var(--bg-secondary);
