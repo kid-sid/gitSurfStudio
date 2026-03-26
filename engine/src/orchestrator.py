@@ -69,6 +69,8 @@ def _read_overview_files(search_path: str, max_chars: int = 6000) -> str:
             pass
     return "\n\n---\n\n".join(parts)
 
+from src.agent.planner import AgentPlanner
+from src.agent.executor import AgentExecutor
 from src.guardrails import validate_answer, validate_action
 from src.tools.search_tool import SearchTool
 from src.tools.vector_search_tool import VectorSearchTool
@@ -228,6 +230,13 @@ def execute_action_loop(
     """
     action_logs: List[str] = []
     answer = None
+    # ── Loop detection state ───────────────────────────────────────────
+    # _exact_calls:  normalized "tool.method:{sorted_args_json}" → count
+    # _method_calls: normalized "tool.method" (ignoring args) → count
+    # The LLM often varies args slightly (different query text, case changes)
+    # to dodge exact-match detection, so we track both granularities.
+    _exact_calls: Dict[str, int] = {}
+    _method_calls: Dict[str, int] = {}
 
     for iteration in range(1, max_iterations + 1):
         print(f"   [Iteration {iteration}/{max_iterations}] Thinking...")
@@ -269,6 +278,76 @@ def execute_action_loop(
             kwargs = decision.get("args", {})
             print(f"   Action -> {tool_name}.{method}({kwargs})")
 
+            # ── Loop detection ──────────────────────────────────────────
+            # Normalize: strip mcp__ prefixes, collapse hyphens/underscores
+            # so alias calls (mcp__context7__resolve-library-id vs
+            # resolve_library_id) are counted together.
+            _norm_name = (tool_name or "").replace("mcp__context7__", "").replace("mcp__", "").replace("-", "_")
+            _exact_key = f"{_norm_name}.{method}:{json.dumps(kwargs, sort_keys=True)}"
+            _method_key = f"{_norm_name}.{method}"
+
+            # Skip loop counting for AutoChain-handled tools — the orchestrator
+            # already intercepts resolve-library-id and auto-calls query-docs,
+            # so the LLM's first call is legitimate and should never be blocked.
+            _is_autochain_target = (
+                ("resolve" in _norm_name and "library" in _norm_name)
+                or ("browser" in _norm_name and "navigate" in _norm_name)
+            )
+
+            if not _is_autochain_target:
+                _exact_calls[_exact_key] = _exact_calls.get(_exact_key, 0) + 1
+                _method_calls[_method_key] = _method_calls.get(_method_key, 0) + 1
+            else:
+                # Still count AutoChain targets, but only for hard-block safety
+                _exact_calls[_exact_key] = _exact_calls.get(_exact_key, 0) + 1
+
+            exact_count = _exact_calls.get(_exact_key, 0)
+            method_count = _method_calls.get(_method_key, 0)
+
+            # Thresholds:
+            #   Soft block  = exact repeat 3+ OR same method 4+ (with varied args)
+            #   Hard block  = exact repeat 4+ OR same method 5+
+            # AutoChain targets only hard-block on exact repeat 3+ (they skip method counting)
+            _soft_limit_exact = 3
+            _soft_limit_method = 4
+            _hard_limit_exact = 4
+            _hard_limit_method = 5
+
+            is_hard_loop = exact_count >= _hard_limit_exact or method_count >= _hard_limit_method
+            is_soft_loop = (not _is_autochain_target) and (
+                exact_count >= _soft_limit_exact or method_count >= _soft_limit_method
+            )
+
+            if is_hard_loop:
+                print(f"   [LoopGuard] Hard block — {_norm_name}.{method} (exact={exact_count}, method={method_count})")
+                observation = (
+                    f"[LoopGuard] BLOCKED — {_norm_name}.{method} has been called too many times. "
+                    f"Forcing final answer with available context."
+                )
+                action_logs.append(f"\n\n--- ACTION LOG ---\nAction taken: {tool_name}.{method}({kwargs})\nObservation: {observation}")
+                context_for_llm = _build_context_for_llm(
+                    initial_context, action_logs, extra_prefix=extra_context_prefix
+                )
+                answer = llm.stream_final_answer(question, context_for_llm, history=history)
+                break
+
+            if is_soft_loop:
+                loop_reason = (
+                    f"exact repeat #{exact_count}" if exact_count >= _soft_limit_exact
+                    else f"same tool.method called {method_count}x with varied args"
+                )
+                print(f"   [LoopGuard] Soft block ({loop_reason}): {_norm_name}.{method}")
+                observation = (
+                    f"[LoopGuard] {_norm_name}.{method} has already been called {max(exact_count, method_count)} time(s) "
+                    f"and returned results. The data you need is in the action logs above. "
+                    f"STOP calling this tool. Use the data from the previous "
+                    f"observation to call a DIFFERENT tool, or "
+                    f"provide your final_answer now."
+                )
+                action_str = f"Action taken: {tool_name}.{method}({kwargs})\nObservation: {observation}"
+                action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}")
+                continue
+
             # Act: Generic tool dispatch
             tool_instance = tools.get(tool_name)
             if tool_instance:
@@ -286,6 +365,120 @@ def execute_action_loop(
             obs_preview = str(observation)[:200]
             print(f"   Observation: {obs_preview}...")
 
+            # ── Auto-chain: resolve-library-id → query-docs ─────────────
+            # The LLM consistently fails to follow through to the second
+            # Context7 call, so we do it programmatically: when resolve
+            # succeeds, immediately call query-docs with the returned
+            # ID and inject both results into the action log.
+            if "resolve" in _norm_name and "library" in _norm_name:
+                _id_match = re.search(r'library ID:\s*(\S+)', str(observation))
+                if _id_match:
+                    _lib_id = _id_match.group(1)
+                    _topic = question[:120]
+                    print(f"   [AutoChain] Resolved library ID: {_lib_id} → fetching docs for topic: \"{_topic}\"")
+
+                    # Find the Context7 docs tool — the server exposes it as
+                    # "query-docs" (not "get-library-docs" as older versions did)
+                    _docs_tool = None
+                    for _candidate_key in [
+                        "mcp__context7__query-docs",
+                        "query_docs",
+                        "query-docs",
+                        "mcp__context7__get-library-docs",
+                        "get_library_docs",
+                        "get-library-docs",
+                    ]:
+                        _docs_tool = tools.get(_candidate_key)
+                        if _docs_tool:
+                            break
+                    # Fallback: scan all context7 tool keys that look doc-related
+                    if not _docs_tool:
+                        for _k, _v in tools.items():
+                            _kn = _k.lower().replace("-", "_")
+                            if "context7" in _kn and ("doc" in _kn or "query" in _kn) and "resolve" not in _kn:
+                                _docs_tool = _v
+                                break
+
+                    if _docs_tool:
+                        try:
+                            # query-docs expects `libraryId` + `query`
+                            _docs_result = _docs_tool.execute(
+                                libraryId=_lib_id, query=_topic
+                            )
+                        except Exception as _e:
+                            _docs_result = f"[Error] query-docs raised: {_e}"
+
+                        _docs_preview = str(_docs_result)[:200]
+                        print(f"   [AutoChain] Docs result: {_docs_preview}...")
+
+                        # Log both steps as a single combined action
+                        action_str = (
+                            f"Action taken: {tool_name}.{method}({kwargs})\n"
+                            f"Observation: Resolved library ID: {_lib_id}\n\n"
+                            f"[AutoChain] Automatically fetched docs for \"{_topic}\":\n"
+                            f"{_docs_result}"
+                        )
+                        reflection = (
+                            "\n--- REFLECT ---\n"
+                            "Library docs have been fetched. Use this documentation to "
+                            "provide a comprehensive final_answer."
+                        )
+                        action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}{reflection}")
+                        continue  # skip generic reflection, go to next iteration
+                    else:
+                        _mcp_keys = [k for k in tools if "mcp" in k.lower() or "library" in k.lower() or "context7" in k.lower()]
+                        print(f"   [AutoChain] docs tool not found — forcing final answer. MCP-like keys: {_mcp_keys}")
+                        # Docs tool missing — skip straight to final answer instead
+                        # of giving the LLM another iteration (it will just retry resolve)
+                        action_logs.append(
+                            f"\n\n--- ACTION LOG ---\n"
+                            f"Action taken: {tool_name}.{method}({kwargs})\n"
+                            f"Observation: Resolved library ID: {_lib_id}. "
+                            f"Docs-fetching tool is unavailable; answering with gathered context."
+                        )
+                        context_for_llm = _build_context_for_llm(
+                            initial_context, action_logs, extra_prefix=extra_context_prefix
+                        )
+                        answer = llm.stream_final_answer(question, context_for_llm, history=history)
+                        break
+
+            # ── Auto-chain: browser_navigate → browser_snapshot ────────
+            if "browser" in _norm_name and "navigate" in _norm_name:
+                if not str(observation).startswith("[Error]"):
+                    print("   [AutoChain] browser_navigate succeeded → auto-calling browser_snapshot")
+
+                    _snapshot_tool = None
+                    for _candidate_key in [
+                        "mcp__playwright__browser_snapshot",
+                        "browser_snapshot",
+                    ]:
+                        _snapshot_tool = tools.get(_candidate_key)
+                        if _snapshot_tool:
+                            break
+
+                    if _snapshot_tool:
+                        try:
+                            _snapshot_result = _snapshot_tool.execute()
+                        except Exception as _e:
+                            _snapshot_result = f"[Error] browser_snapshot raised: {_e}"
+
+                        _snap_preview = str(_snapshot_result)[:200]
+                        print(f"   [AutoChain] Snapshot result: {_snap_preview}...")
+
+                        action_str = (
+                            f"Action taken: {tool_name}.{method}({kwargs})\n"
+                            f"Observation: {observation}\n\n"
+                            f"[AutoChain] Automatically captured page snapshot:\n"
+                            f"{_snapshot_result}"
+                        )
+                        reflection = (
+                            "\n--- REFLECT ---\n"
+                            "Page navigated and snapshot captured. Analyze the snapshot to determine "
+                            "if you need to interact further or can provide a final_answer."
+                        )
+                        action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}{reflection}")
+                        continue  # skip generic reflection
+
             # Reflect: record this step as a log entry
             action_str = f"Action taken: {tool_name}.{method}({kwargs})\nObservation: {observation}"
             reflection = (
@@ -301,7 +494,11 @@ def execute_action_loop(
             break
 
     if answer is None:
-        answer = "Error: Agent reached maximum iterations without giving a final answer."
+        print("   [Warning] Max iterations reached without final_answer — forcing answer synthesis.")
+        context_for_llm = _build_context_for_llm(
+            initial_context, action_logs, extra_prefix=extra_context_prefix
+        )
+        answer = llm.stream_final_answer(question, context_for_llm, history=history)
 
     # Validate final answer — redact secrets/PII, append safety notices
     answer, answer_warnings = validate_answer(answer)
@@ -495,6 +692,7 @@ def run_code_aware_pipeline(
         project_structure=project_structure,
         extra_context_prefix=extra_prefix,
         history=history,
+        max_iterations=8,
     )
     return answer, initial_context
 
@@ -631,7 +829,7 @@ def run_local_pipeline(
                 available_tools=available_tools,
                 project_structure=project_structure,
                 history=history,
-                max_iterations=1,   # answer immediately — no tool calls needed
+                max_iterations=3,   # allow MCP tool calls (e.g. context7) before synthesizing
             )
             return answer, initial_context
         print("   [Tier-0] No README or project docs found. Falling through to full pipeline.")
@@ -676,7 +874,7 @@ def run_local_pipeline(
                 available_tools=available_tools,
                 project_structure=project_structure,
                 history=history,
-                max_iterations=1,
+                max_iterations=3,   # allow MCP tool calls (e.g. context7) before synthesizing
             )
             return answer, initial_context
         print("   [Tier-1] No project docs found. Falling through to full pipeline.")
@@ -788,5 +986,87 @@ def run_local_pipeline(
         available_tools=available_tools,
         project_structure=project_structure,
         history=history,
+        max_iterations=8,
     )
     return answer, initial_context
+
+
+# ── Pipeline: Agent Mode (Plan → Execute → Verify) ────────────────────────────
+
+def run_agent_pipeline(
+    question: str,
+    search_path: str,
+    llm,
+    project_context: str,
+    available_tools: str,
+    tools: Dict,
+    history=None,
+    ctx: Optional[PipelineContext] = None,
+    terminal_tool=None,
+) -> tuple:
+    """
+    Agent-mode pipeline: Plan → Execute → Verify.
+
+    Unlike the Q&A pipelines, this creates a structured plan first,
+    then executes it step-by-step with verification and re-planning.
+    Returns (answer: str, changeset_dict: dict).
+    """
+    print("\n[Agent Pipeline] Plan → Execute → Verify")
+
+    # Step 1: Build file tree for context
+    print("[Step 1] Building project context...")
+    project_structure = build_local_file_tree(search_path)
+
+    # Step 2: Gather initial context from targeted files
+    print("[Step 2] Gathering initial context...")
+    refined_data = llm.refine_user_query(
+        question, history=history, project_context=project_context,
+        file_structure=project_structure,
+    )
+    target_files = refined_data.get("target_files", [])
+
+    initial_context = ""
+    if target_files:
+        targeted_chunks = retrieve_local_files(search_path, target_files)
+        initial_context = "\n\n---\n\n".join(c["content"] for c in targeted_chunks)
+        print(f"   Retrieved {len(targeted_chunks)} targeted file(s)")
+
+    # Step 3: Generate plan
+    print("[Step 3] Generating execution plan...")
+    planner = AgentPlanner(llm)
+    plan = planner.create_plan(
+        user_request=question,
+        project_context=project_context,
+        file_structure=project_structure,
+        available_tools=available_tools,
+        history=history,
+    )
+    print(f"   Plan: {plan.goal} ({plan.total_steps} steps, {plan.complexity})")
+
+    # Step 4: Execute plan
+    print("[Step 4] Executing plan...")
+    executor = AgentExecutor(
+        llm=llm,
+        tools=tools,
+        available_tools=available_tools,
+        planner=planner,
+        workspace_path=search_path,
+        terminal_tool=terminal_tool,
+    )
+
+    result = executor.execute(
+        plan=plan,
+        initial_context=initial_context,
+        project_structure=project_structure,
+        history=history,
+    )
+
+    print(f"   [Agent] Status: {result.status} "
+          f"({result.plan.completed_steps}/{result.plan.total_steps} steps done)")
+
+    if result.changeset.changes:
+        print(f"   [Agent] Files changed: {len(result.changeset.changes)}")
+        for change in result.changeset.changes:
+            print(f"     {change.diff_summary}")
+
+    return result.answer, result.changeset.to_dict()

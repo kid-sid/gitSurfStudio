@@ -61,11 +61,13 @@ from src.tools.git_tool import GitTool
 from src.tools.editor_ui_tool import EditorUITool
 from src.tools.symbol_extractor import SymbolExtractor
 from src.tools.symbol_peeker import SymbolPeeker
-from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, PipelineContext
+from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, run_agent_pipeline, PipelineContext
 from src.security import PromptGuard, TopicGuard
 from src.security.supabase_logger import log_security_event
 from src.mcp.client_manager import MCPClientManager
 from src.mcp.tool_proxy import MCPToolProxy
+from src.tools.browser_tool import BrowserTool
+from src.tools.terminal_tool import TerminalTool
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -109,7 +111,10 @@ class EngineState:
         self.chat_memory: Optional[ChatMemory] = None     # wired after LLM init
         self.mcp_manager: Optional[MCPClientManager] = None
         self.mcp_ready: bool = False
-        self.available_tools: str = AVAILABLE_TOOLS  # extended with MCP tools once ready
+        self.available_tools: str = ""  # populated after AVAILABLE_TOOLS is defined below
+        self.terminal_tool: Optional[TerminalTool] = None
+        self.active_changesets: Dict[str, Any] = {}  # changeset_id -> changeset dict
+        self.active_executor = None  # current AgentExecutor (for cancel/respond)
 
     def get_active_token(self) -> Optional[str]:
         return self.github_token or os.getenv("GITHUB_TOKEN")
@@ -125,6 +130,9 @@ def _safe_path(workspace: str, user_path: str) -> str:
     Raises HTTP 403 if the resolved path is outside the workspace.
     """
     workspace_real = os.path.realpath(workspace) + os.sep
+    # If user_path is relative, resolve it against the workspace (not CWD)
+    if not os.path.isabs(user_path):
+        user_path = os.path.join(workspace, user_path)
     resolved = os.path.realpath(user_path)
     # Append sep before comparing so the workspace root itself passes the check
     # (e.g. resolved == workspace without trailing sep would otherwise be rejected)
@@ -138,6 +146,7 @@ class ChatRequest(BaseModel):
     path: str
     history: Optional[List[Dict[str, str]]] = []
     user_id: Optional[str] = None   # Supabase auth user ID, passed by frontend
+    agent_mode: bool = False        # True = Plan→Execute→Verify pipeline
 
     @field_validator("query")
     @classmethod
@@ -365,7 +374,34 @@ Tool: SymbolPeekerTool
 Description: Peek the definition of any function or class by name (like F12 in VS Code). Returns the full source block, file path, and line range. Use this to inspect a symbol's current implementation before editing it — avoids reading entire files.
 Methods:
   - peek_symbol(symbol_name): Returns [{file, type, name, start_line, end_line, content}]
+
+Tool: BrowserTool
+Description: High-level browser automation for verifying pages, testing interactions, and debugging client-side issues. Uses Playwright under the hood. Prefer this over raw mcp__playwright__* calls for multi-step browser workflows.
+Methods:
+  - verify_page(url, checks=None, wait_ms=2000)
+    Navigate to URL, capture snapshot + screenshot, optionally check for expected text.
+    checks: JSON array of strings, e.g. '["Submit button", "Welcome"]'
+  - test_interaction(url, steps)
+    Execute a sequence of browser actions and report pass/fail per step.
+    steps: JSON array, e.g. '[{"action":"click","element":"Login"},{"action":"snapshot","expect":"Dashboard"}]'
+  - debug_page(url)
+    Capture snapshot, screenshot, and console messages for debugging.
+  - scrape_rendered(url)
+    Fetch content from a JavaScript-rendered page (use instead of WebSearchTool.fetch_url for SPAs).
+
+Tool: TerminalTool
+Description: Execute shell commands safely in the workspace (tests, linting, builds).
+Methods:
+  - run_command(command, timeout_sec=30, cwd=None)
+    Run a shell command. Only safe commands are allowed (pytest, ruff, npm, node, etc.).
+  - run_test(test_path=None)
+    Run project tests (auto-detects pytest or npm test).
+  - run_lint(file_path=None)
+    Run linter (ruff for Python, eslint for JS/TS/Svelte).
 """
+
+# Seed the default — _init_mcp_background will append MCP tools once servers are ready
+state.available_tools = AVAILABLE_TOOLS
 
 
 def _build_mcp_schema_hint(input_schema: dict) -> str:
@@ -504,6 +540,9 @@ def _ensure_initialized(workspace_path: str):
             rebuild_index=False,
         )
 
+        terminal_tool = TerminalTool(workspace_path=workspace_path)
+        state.terminal_tool = terminal_tool
+
         state.agent_tools = {
             "FileEditorTool": file_editor,
             "GitTool": git_tool,
@@ -511,6 +550,8 @@ def _ensure_initialized(workspace_path: str):
             "SearchTool": searcher,
             "WebSearchTool": web_tool,
             "SymbolPeekerTool": SymbolPeekerTool(state.pipeline_ctx, workspace_path),
+            "BrowserTool": BrowserTool(tools_getter=lambda: state.agent_tools),
+            "TerminalTool": terminal_tool,
         }
         state.git_tool = git_tool
 
@@ -955,6 +996,37 @@ async def write_file(req: WriteRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class MkdirRequest(BaseModel):
+    path: str
+
+    @field_validator("path")
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("path cannot be empty")
+        return v
+
+
+class RenameRequest(BaseModel):
+    old_path: str
+    new_path: str
+
+
+@app.post("/mkdir")
+async def mkdir(req: MkdirRequest):
+    """Creates a directory on local disk."""
+    if state.workspace_path:
+        abs_path = _safe_path(state.workspace_path, req.path)
+    else:
+        abs_path = os.path.realpath(req.path)
+
+    try:
+        os.makedirs(abs_path, exist_ok=True)
+        return {"status": "success", "message": f"Created directory {abs_path}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/restore")
 async def restore_file(req: RestoreRequest):
     """Restores a file from its .bak backup created by FileEditorTool."""
@@ -1009,6 +1081,48 @@ async def delete_file_endpoint(req: RestoreRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"status": "ok"}
+
+
+@app.post("/rename")
+async def rename_entry(req: RenameRequest):
+    """Renames (moves) a file or directory."""
+    if state.workspace_path:
+        abs_old = _safe_path(state.workspace_path, req.old_path)
+        abs_new = _safe_path(state.workspace_path, req.new_path)
+    else:
+        abs_old = os.path.realpath(req.old_path)
+        abs_new = os.path.realpath(req.new_path)
+
+    if not os.path.exists(abs_old):
+        raise HTTPException(status_code=404, detail="Source path not found")
+    if os.path.exists(abs_new):
+        raise HTTPException(status_code=409, detail="Destination already exists")
+
+    try:
+        os.rename(abs_old, abs_new)
+        return {"status": "ok", "old_path": abs_old, "new_path": abs_new}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/delete-dir")
+async def delete_directory(req: RestoreRequest):
+    """Recursively deletes a directory."""
+    import shutil
+
+    if state.workspace_path:
+        abs_path = _safe_path(state.workspace_path, req.path)
+    else:
+        abs_path = os.path.realpath(req.path)
+
+    if not os.path.isdir(abs_path):
+        raise HTTPException(status_code=404, detail="Directory not found")
+
+    try:
+        shutil.rmtree(abs_path)
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/complete")
@@ -1198,16 +1312,34 @@ async def chat(request: Request, req: ChatRequest):
             writer = QueueWriter(log_queue)
             try:
                 with redirect_stdout(writer):
-                    answer, context = run_local_pipeline(
-                        question=req.query,
-                        search_path=req.path,
-                        llm=llm,
-                        project_context=project_context,
-                        available_tools=state.available_tools or AVAILABLE_TOOLS,
-                        tools=agent_tools,
-                        history=effective_history,
-                        ctx=pipeline_ctx or PipelineContext(req.path),
-                    )
+                    if req.agent_mode:
+                        # Agent mode: Plan → Execute → Verify
+                        answer, changeset_dict = run_agent_pipeline(
+                            question=req.query,
+                            search_path=req.path,
+                            llm=llm,
+                            project_context=project_context,
+                            available_tools=state.available_tools or AVAILABLE_TOOLS,
+                            tools=agent_tools,
+                            history=effective_history,
+                            ctx=pipeline_ctx or PipelineContext(req.path),
+                            terminal_tool=state.terminal_tool,
+                        )
+                        context = ""
+                        # Store changeset for rollback
+                        if changeset_dict and changeset_dict.get("id"):
+                            state.active_changesets[changeset_dict["id"]] = changeset_dict
+                    else:
+                        answer, context = run_local_pipeline(
+                            question=req.query,
+                            search_path=req.path,
+                            llm=llm,
+                            project_context=project_context,
+                            available_tools=state.available_tools or AVAILABLE_TOOLS,
+                            tools=agent_tools,
+                            history=effective_history,
+                            ctx=pipeline_ctx or PipelineContext(req.path),
+                        )
                 writer.flush()
                 result_holder["answer"] = answer
                 result_holder["context"] = context
@@ -1472,6 +1604,92 @@ async def terminal_ws(websocket: WebSocket, cwd: Optional[str] = None):
                 await asyncio.wait_for(process.wait(), timeout=1.0)
             except Exception:
                 pass
+
+
+# ── Agent API Routes ──────────────────────────────────────────────────────────
+
+
+class AgentRollbackRequest(BaseModel):
+    changeset_id: str
+    file_path: Optional[str] = None  # None = rollback all
+
+
+class AgentRespondRequest(BaseModel):
+    response: str
+
+
+@app.post("/agent/rollback")
+async def agent_rollback(req: AgentRollbackRequest):
+    """Rollback agent changes — all files or a single file."""
+    from src.agent.changeset import Changeset
+
+    changeset_data = state.active_changesets.get(req.changeset_id)
+    if not changeset_data:
+        raise HTTPException(status_code=404, detail="Changeset not found")
+
+    # Reconstruct changeset from stored data for rollback
+    # For now, we store the full changeset object
+    changeset = changeset_data if isinstance(changeset_data, Changeset) else None
+    if not changeset:
+        raise HTTPException(status_code=400, detail="Changeset data is summary-only; full rollback requires active changeset")
+
+    if req.file_path:
+        workspace = state.workspace_path
+        if not workspace:
+            raise HTTPException(status_code=400, detail="No workspace initialized")
+        abs_path = os.path.abspath(os.path.join(workspace, req.file_path))
+        result = changeset.rollback_file(abs_path)
+        return {"status": "rolled_back", "detail": result}
+    else:
+        results = changeset.rollback_all()
+        return {"status": "rolled_back", "details": results}
+
+
+@app.post("/agent/accept")
+async def agent_accept(req: AgentRollbackRequest):
+    """Accept agent changes — clean up backups."""
+    from src.agent.changeset import Changeset
+
+    changeset_data = state.active_changesets.get(req.changeset_id)
+    if not changeset_data:
+        raise HTTPException(status_code=404, detail="Changeset not found")
+
+    if isinstance(changeset_data, Changeset):
+        changeset_data.accept()
+    state.active_changesets.pop(req.changeset_id, None)
+    return {"status": "accepted"}
+
+
+@app.post("/agent/cancel")
+async def agent_cancel():
+    """Cancel the currently running agent task."""
+    executor = state.active_executor
+    if executor:
+        executor.cancel()
+        return {"status": "cancelling"}
+    return {"status": "no_active_task"}
+
+
+@app.post("/agent/respond")
+async def agent_respond(req: AgentRespondRequest):
+    """Send a user response to a paused agent (human-in-the-loop)."""
+    executor = state.active_executor
+    if executor:
+        executor.provide_user_response(req.response)
+        return {"status": "response_sent"}
+    return {"status": "no_active_task"}
+
+
+@app.get("/agent/changesets")
+async def list_changesets():
+    """List all active changesets."""
+    summaries = []
+    for cid, data in state.active_changesets.items():
+        if isinstance(data, dict):
+            summaries.append(data)
+        else:
+            summaries.append(data.to_dict())
+    return {"changesets": summaries}
 
 
 # entry point
