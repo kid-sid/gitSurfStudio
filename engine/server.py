@@ -53,6 +53,7 @@ from src.llm_client import LLMClient
 from src.history_manager import HistoryManager
 from src.memory.supabase_memory import SupabaseMemory
 from src.memory.chat_memory import ChatMemory
+from src.memory.redis_session_memory import RedisSessionMemory
 from src.tools.file_editor_tool import FileEditorTool
 from src.tools.search_tool import SearchTool
 from src.tools.web_tool import WebSearchTool
@@ -109,12 +110,15 @@ class EngineState:
         self.supabase_memory = SupabaseMemory()
         self._pending_memory_save: Optional[Dict] = None  # set by /init when reindex needed
         self.chat_memory: Optional[ChatMemory] = None     # wired after LLM init
+        self.session_memory: RedisSessionMemory = RedisSessionMemory()  # in-session agent recovery
         self.mcp_manager: Optional[MCPClientManager] = None
         self.mcp_ready: bool = False
         self.available_tools: str = ""  # populated after AVAILABLE_TOOLS is defined below
         self.terminal_tool: Optional[TerminalTool] = None
         self.active_changesets: Dict[str, Any] = {}  # changeset_id -> changeset dict
         self.active_executor = None  # current AgentExecutor (for cancel/respond)
+        self.active_session_id: Optional[str] = None  # session_id for current agent task
+        self.active_task_id: Optional[str] = None  # task_id for current agent task
 
     def get_active_token(self) -> Optional[str]:
         return self.github_token or os.getenv("GITHUB_TOKEN")
@@ -337,17 +341,17 @@ AVAILABLE_TOOLS = """
 Tool: FileEditorTool
 Description: Read, write, modify, or delete files inside the project directory.
 Methods:
-  - read_file(rel_path, start_line=None, end_line=None)
-  - write_file(rel_path, content)
-  - replace_in_file(rel_path, target, replacement, allow_multiple=False)
+  - read_file(path, start_line=None, end_line=None)
+  - write_file(path, content): Creates a NEW file. Fails if the file exists. Use replace_in_file for existing files.
+  - replace_in_file(path, target, replacement, allow_multiple=False)
     NOTE: target must match exactly once unless allow_multiple=True.
     On ambiguity, returns the line numbers of all matches to help refine the target.
-  - delete_file(rel_path)
+  - delete_file(path)
 
 Tool: EditorUITool
 Description: Control the IDE user interface.
 Methods:
-  - open_file(rel_path)
+  - open_file(path)
     Opens the specified file in an editor tab.
  
 Tool: GitTool
@@ -944,7 +948,7 @@ async def get_files(path: str):
         children = []
         try:
             for item in sorted(os.listdir(current_path_str)):
-                if item in {".git", "__pycache__", "node_modules", ".cache", "venv", ".venv"}:
+                if item in {".git", "__pycache__", "node_modules", ".cache", "venv", ".venv", ".claude"}:
                     continue
                 children.append(build_tree(os.path.join(current_path_str, item)))
         except PermissionError:
@@ -1324,6 +1328,9 @@ async def chat(request: Request, req: ChatRequest):
                             history=effective_history,
                             ctx=pipeline_ctx or PipelineContext(req.path),
                             terminal_tool=state.terminal_tool,
+                            state=state,
+                            session_id=session_id,
+                            session_memory=state.session_memory,
                         )
                         context = ""
                         # Store changeset for rollback
@@ -1616,6 +1623,8 @@ class AgentRollbackRequest(BaseModel):
 
 class AgentRespondRequest(BaseModel):
     response: str
+    step_id: Optional[int] = None  # which step asked the question
+    question: Optional[str] = None  # the question that was asked
 
 
 @app.post("/agent/rollback")
@@ -1675,6 +1684,21 @@ async def agent_respond(req: AgentRespondRequest):
     """Send a user response to a paused agent (human-in-the-loop)."""
     executor = state.active_executor
     if executor:
+        # Store human feedback to session memory if available
+        if (
+            state.session_memory
+            and state.active_session_id
+            and state.active_task_id
+            and req.step_id is not None
+            and req.question is not None
+        ):
+            state.session_memory.add_human_feedback(
+                session_id=state.active_session_id,
+                task_id=state.active_task_id,
+                step_id=req.step_id,
+                question=req.question,
+                response=req.response,
+            )
         executor.provide_user_response(req.response)
         return {"status": "response_sent"}
     return {"status": "no_active_task"}

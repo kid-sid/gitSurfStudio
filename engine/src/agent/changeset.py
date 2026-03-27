@@ -194,6 +194,29 @@ class Changeset:
             "commands_run": len(self.commands_run),
         }
 
+    def to_full_dict(self) -> Dict:
+        """Full serialization including file contents (for persistence and rollback)."""
+        return {
+            "id": self.id,
+            "goal": self.goal,
+            "workspace_path": self.workspace_path,
+            "status": self.status,
+            "files": [
+                {
+                    "path": c.path,
+                    "rel_path": c.rel_path,
+                    "action": c.action,
+                    "original_content": c.original_content,
+                    "new_content": c.new_content,
+                    "original_hash": c.original_hash,
+                    "step_id": c.step_id,
+                    "diff_summary": c.diff_summary,
+                }
+                for c in self.changes
+            ],
+            "commands_run": self.commands_run,
+        }
+
     def summary(self) -> str:
         """Human-readable summary."""
         lines = [f"Changeset {self.id}: {self.goal}"]

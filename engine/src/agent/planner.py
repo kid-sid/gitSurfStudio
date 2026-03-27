@@ -38,6 +38,13 @@ class PlanStep:
             "status": self.status,
         }
 
+    def to_full_dict(self) -> Dict:
+        """Full serialization including observation and error (for persistence)."""
+        d = self.to_dict()
+        d["observation"] = self.observation
+        d["error"] = self.error
+        return d
+
 
 @dataclass
 class AgentPlan:
@@ -87,6 +94,15 @@ class AgentPlan:
             "steps": [s.to_dict() for s in self.steps],
         }
 
+    def to_full_dict(self) -> Dict:
+        """Full serialization including step observations and errors (for persistence)."""
+        return {
+            "goal": self.goal,
+            "complexity": self.complexity,
+            "estimated_files": self.estimated_files,
+            "steps": [s.to_full_dict() for s in self.steps],
+        }
+
     def summary(self) -> str:
         """Human-readable plan summary for streaming to frontend."""
         lines = [f"**Plan:** {self.goal}"]
@@ -97,7 +113,7 @@ class AgentPlan:
                 "running": "●",
                 "done": "✓",
                 "failed": "✗",
-                "skipped": "–",
+                "skipped": "-",
             }.get(step.status, "?")
             deps = f" (after step {step.depends_on})" if step.depends_on else ""
             lines.append(f"  {status_icon} Step {step.id}: {step.description}{deps}")
@@ -234,18 +250,93 @@ class AgentPlanner:
         failed_step.status = "skipped"
         return original_plan
 
+    # Tools that actually exist in the agent's tool registry
+    _VALID_TOOLS = {
+        "FileEditorTool", "GitTool", "EditorUITool", "SearchTool",
+        "WebSearchTool", "SymbolPeekerTool", "BrowserTool", "TerminalTool",
+        "__action_loop__",
+    }
+
+    # Methods that are no-ops (checking if dir exists, navigating, etc.) —
+    # these never make progress and should be dropped from plans.
+    _NOOP_METHODS = {
+        "change_directory", "cd", "navigate", "check_exists",
+        "list_directory", "ls", "pwd", "get_cwd",
+    }
+
+    # Known hallucinated tool names → replacement tool
+    _TOOL_ALIASES = {
+        "FileSystemTool": "TerminalTool",
+        "FileTool": "FileEditorTool",
+        "NodeTool": "TerminalTool",
+        "PipTool": "TerminalTool",
+        "NpmTool": "TerminalTool",
+        "ShellTool": "TerminalTool",
+        "BashTool": "TerminalTool",
+        "CommandTool": "TerminalTool",
+        "DockerTool": "TerminalTool",
+        "PackageTool": "TerminalTool",
+        "DirectoryTool": "TerminalTool",
+        "CodeSearchTool": "SearchTool",
+        "GrepTool": "SearchTool",
+        "ReadFileTool": "FileEditorTool",
+        "WriteFileTool": "FileEditorTool",
+    }
+
+    def _sanitize_step(self, step_data: Dict, index: int) -> Optional[Dict]:
+        """
+        Validate and fix a single step dict from LLM output.
+        Returns None if the step should be dropped entirely.
+        """
+        tool = step_data.get("tool", "FileEditorTool")
+        method = step_data.get("method", "read_file")
+
+        # Remap hallucinated tool names to real ones
+        if tool not in self._VALID_TOOLS:
+            remapped = self._TOOL_ALIASES.get(tool)
+            if remapped:
+                print(f"   [Planner] Remapped {tool} → {remapped}")
+                tool = remapped
+                step_data = dict(step_data, tool=tool)
+            else:
+                # Unknown tool with no alias → delegate to action loop which handles it
+                print(f"   [Planner] Unknown tool '{tool}', delegating to __action_loop__")
+                return {
+                    "description": step_data.get("description", f"Step {index}"),
+                    "tool": "__action_loop__",
+                    "method": "execute",
+                    "args": {"question": step_data.get("description", f"Step {index}: {tool}.{method}")},
+                    "depends_on": step_data.get("depends_on", []),
+                    "verification": step_data.get("verification"),
+                }
+
+        # Drop pure no-op navigation / existence-check steps
+        if method in self._NOOP_METHODS:
+            print(f"   [Planner] Dropped no-op step: {tool}.{method}")
+            return None
+
+        # Fix FileSystemTool.change_directory specifically
+        if tool == "TerminalTool" and method in self._NOOP_METHODS:
+            print(f"   [Planner] Dropped no-op terminal step: {method}")
+            return None
+
+        return step_data
+
     def _parse_plan(self, data: Dict) -> AgentPlan:
-        """Parse LLM JSON output into an AgentPlan."""
+        """Parse LLM JSON output into an AgentPlan, sanitizing invalid steps."""
         steps = []
         for i, step_data in enumerate(data.get("steps", []), start=1):
+            sanitized = self._sanitize_step(step_data, i)
+            if sanitized is None:
+                continue  # Drop no-op steps
             steps.append(PlanStep(
-                id=i,
-                description=step_data.get("description", f"Step {i}"),
-                tool=step_data.get("tool", "FileEditorTool"),
-                method=step_data.get("method", "read_file"),
-                args=step_data.get("args", {}),
-                depends_on=step_data.get("depends_on", []),
-                verification=step_data.get("verification"),
+                id=len(steps) + 1,  # re-number after drops
+                description=sanitized.get("description", f"Step {i}"),
+                tool=sanitized.get("tool", "FileEditorTool"),
+                method=sanitized.get("method", "read_file"),
+                args=sanitized.get("args", {}),
+                depends_on=sanitized.get("depends_on", []),
+                verification=sanitized.get("verification"),
             ))
 
         return AgentPlan(
