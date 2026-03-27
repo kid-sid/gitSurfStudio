@@ -265,16 +265,27 @@
         if (cmd === 'agent_step') {
           try {
             const stepData = JSON.parse(args);
-            if (agentPlan?.steps) {
-              const step = agentPlan.steps.find(s => s.id === stepData.step_id);
-              if (step) {
-                step.status = stepData.status;
-                if (stepData.error) step.error = stepData.error;
-                agentPlan = { ...agentPlan }; // trigger reactivity
-              }
+            if (!agentPlan) {
+              // Create a dummy plan if none exists (for Q&A pipelines)
+              agentPlan = { goal: lastQuery, steps: [] };
             }
+            let step = agentPlan.steps.find(s => s.id === stepData.step_id);
+            if (step) {
+              step.status = stepData.status;
+              if (stepData.error) step.error = stepData.error;
+            } else {
+              // Dynamically add step if it doesn't exist (e.g. Iteration steps)
+              agentPlan.steps.push({
+                id: stepData.step_id,
+                description: stepData.description || `Step ${stepData.step_id}`,
+                status: stepData.status,
+                error: stepData.error
+              });
+            }
+            agentPlan = { ...agentPlan }; // trigger reactivity
+            
             if (stepData.status === 'running') {
-              statusText = `🤖 Step ${stepData.step_id}: ${stepData.description || 'Executing...'}`;
+              statusText = `🤖 ${stepData.description || 'Executing...'}`;
             }
           } catch {}
           return;
@@ -562,8 +573,8 @@
           </div>
         {/if}
 
-        <!-- Agent Progress (shown in agent mode during execution) -->
-        {#if msg.role === "assistant" && agentPlan}
+        <!-- Agent Progress (shown when a plan exists) -->
+        {#if msg.role === "assistant" && agentPlan && msg.thinking}
           <AgentProgress plan={agentPlan} isRunning={agentRunning} onCancel={() => { agentRunning = false; }} />
         {/if}
 

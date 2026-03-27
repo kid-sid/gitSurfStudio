@@ -190,7 +190,7 @@ def _build_context_for_llm(
     the budget is exceeded, printing a notice so the LLM knows steps were omitted.
     """
     prefix = f"{extra_prefix}\n\n" if extra_prefix else ""
-    base = prefix + initial_context[:_INITIAL_CONTEXT_RESERVE]
+    base = prefix + str(initial_context)[:_INITIAL_CONTEXT_RESERVE]
     budget = _MAX_CONTEXT_CHARS - len(base)
 
     if budget <= 0:
@@ -240,6 +240,7 @@ def execute_action_loop(
 
     for iteration in range(1, max_iterations + 1):
         print(f"   [Iteration {iteration}/{max_iterations}] Thinking...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 100 + iteration, 'status': 'running', 'description': f'Iteration {iteration}: Reasoning...'})}")
 
         context_for_llm = _build_context_for_llm(
             initial_context, action_logs, extra_prefix=extra_context_prefix
@@ -266,6 +267,7 @@ def execute_action_loop(
         print(f"   Thought: {thought}")
 
         if action_type == "final_answer":
+            print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 100 + iteration, 'status': 'done'})}")
             # Stream the answer token-by-token via stdout ([ANSWER_TOKEN] prefix)
             answer = llm.stream_final_answer(
                 question, context_for_llm, history=history
@@ -294,27 +296,34 @@ def execute_action_loop(
                 or ("browser" in _norm_name and "navigate" in _norm_name)
             )
 
-            if not _is_autochain_target:
-                _exact_calls[_exact_key] = _exact_calls.get(_exact_key, 0) + 1
+            # Methods that legitimately operate on different files each call
+            # should only be blocked on exact duplicates, not method-level.
+            # e.g. read_file("server.py") vs read_file("api.js") are NOT loops.
+            _multi_target_methods = {
+                "read_file", "write_file", "replace_in_file", "delete_file",
+                "search", "search_and_chunk", "peek_symbol",
+                "list_dir", "list_recursive", "list_files",
+            }
+            _skip_method_counting = (method or "") in _multi_target_methods or _is_autochain_target
+
+            _exact_calls[_exact_key] = _exact_calls.get(_exact_key, 0) + 1
+            if not _skip_method_counting:
                 _method_calls[_method_key] = _method_calls.get(_method_key, 0) + 1
-            else:
-                # Still count AutoChain targets, but only for hard-block safety
-                _exact_calls[_exact_key] = _exact_calls.get(_exact_key, 0) + 1
 
             exact_count = _exact_calls.get(_exact_key, 0)
             method_count = _method_calls.get(_method_key, 0)
 
             # Thresholds:
-            #   Soft block  = exact repeat 3+ OR same method 4+ (with varied args)
-            #   Hard block  = exact repeat 4+ OR same method 5+
-            # AutoChain targets only hard-block on exact repeat 3+ (they skip method counting)
+            #   Soft block  = exact repeat 3+ OR same method 5+ (with varied args)
+            #   Hard block  = exact repeat 4+ OR same method 7+
+            # Multi-target methods only use exact-match counting.
             _soft_limit_exact = 3
-            _soft_limit_method = 4
+            _soft_limit_method = 5
             _hard_limit_exact = 4
-            _hard_limit_method = 5
+            _hard_limit_method = 7
 
             is_hard_loop = exact_count >= _hard_limit_exact or method_count >= _hard_limit_method
-            is_soft_loop = (not _is_autochain_target) and (
+            is_soft_loop = (not _skip_method_counting) and (
                 exact_count >= _soft_limit_exact or method_count >= _soft_limit_method
             )
 
@@ -364,6 +373,7 @@ def execute_action_loop(
 
             obs_preview = str(observation)[:200]
             print(f"   Observation: {obs_preview}...")
+            print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 100 + iteration, 'status': 'done'})}")
 
             # ── Auto-chain: resolve-library-id → query-docs ─────────────
             # The LLM consistently fails to follow through to the second
@@ -526,8 +536,26 @@ def run_code_aware_pipeline(
     """
     print("\n[Code-Aware Pipeline]")
 
+    # Emit plan for UI
+    code_aware_plan = {
+        "goal": question,
+        "complexity": "complex",
+        "steps": [
+            {"id": 1, "description": "Loading Project Skeleton", "status": "pending"},
+            {"id": 2, "description": "Refining Query", "status": "pending"},
+            {"id": 3, "description": "Skeleton Analysis", "status": "pending"},
+            {"id": 4, "description": "Targeted File Retrieval", "status": "pending"},
+            {"id": 5, "description": "Code Analysis (Symbols + Call Graph)", "status": "pending"},
+            {"id": 6, "description": "Triple-Hybrid Search", "status": "pending"},
+            {"id": 7, "description": "Merging + Reranking", "status": "pending"},
+            {"id": 8, "description": "Agentic Action Loop", "status": "pending"},
+        ]
+    }
+    print(f"[UI_COMMAND] agent_plan {json.dumps(code_aware_plan)}")
+
     # Step 1: Load Project Skeleton + Symbol MiniMap
     print("[Step 1/8] Loading Project Skeleton...")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 1, 'status': 'running'})}")
     project_structure = ""
     structure_path = os.path.join(search_path, "project_structure.txt")
     if os.path.exists(structure_path):
@@ -550,6 +578,8 @@ def run_code_aware_pipeline(
 
     # Step 2: Query Refinement
     print("[Step 2/8] Refining Query (Technical Intent)...")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 1, 'status': 'done'})}")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 2, 'status': 'running'})}")
     refined_data = llm.refine_user_query(
         question, history=history, project_context=project_context, file_structure=project_structure
     )
@@ -584,9 +614,12 @@ def run_code_aware_pipeline(
 
     if is_action_request:
         print("   [Fast-Path] Action command detected. Skipping search pipeline (Steps 3-7).")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 2, 'status': 'done'})}")
     else:
         # Step 3: Skeleton Analysis
         print("[Step 3/8] Skeleton Analysis (identifying relevant files)...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 2, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'running'})}")
         targeted_files: List[str] = []
         if project_structure:
             targeted_files = llm.identify_relevant_files(
@@ -599,6 +632,8 @@ def run_code_aware_pipeline(
 
         # Step 4: Targeted File Retrieval
         print("[Step 4/8] Targeted File Retrieval...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'running'})}")
         targeted_retriever = TargetedRetriever(cache_path=search_path)
         targeted_chunks: List[Dict] = []
         if targeted_files:
@@ -609,6 +644,8 @@ def run_code_aware_pipeline(
 
         # Step 5: Symbol Extraction + Call Graph
         print("[Step 5/8] Code Analysis (Symbols + Call Graph)...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'running'})}")
         sym_extractor = ctx.sym_extractor if ctx else SymbolExtractor(cache_dir=os.path.join(".cache", "symbols"))
         symbol_index = sym_extractor.extract_from_directory(
             search_path, force_rebuild=rebuild_index
@@ -618,6 +655,8 @@ def run_code_aware_pipeline(
 
         # Step 6: Triple-Hybrid Search
         print("[Step 6/8] Triple-Hybrid Search (Skeleton-Guided)...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 6, 'status': 'running'})}")
         vector_tool = ctx.vector_tool if ctx else VectorSearchTool(
             embedding_client=EmbeddingClient(), cache_dir=os.path.join(".cache", "vector_index")
         )
@@ -649,6 +688,8 @@ def run_code_aware_pipeline(
 
         # Step 7: Merge + Rerank
         print("[Step 7/8] Merging + Reranking...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 6, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 7, 'status': 'running'})}")
         print(f"   [Orchestrator] Keeping {len(targeted_chunks)} targeted chunks.")
         reranker = ctx.reranker if ctx else CrossEncoderReranker()
         slots_remaining = max(10 - len(targeted_chunks), 3)
@@ -680,6 +721,8 @@ def run_code_aware_pipeline(
 
     # Step 8: Agentic Action Loop
     print("[Step 8/8] Agentic Action Loop (Synthesizing/Editing)...")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 7, 'status': 'done'})}")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 8, 'status': 'running'})}")
     initial_context = "\n\n---\n\n".join(c["content"] for c in top_chunks)
     extra_prefix = f"{skeleton_context}\n\n{call_graph_context}".strip()
 
@@ -836,12 +879,30 @@ def run_local_pipeline(
 
     # Step 1: Build local file tree
     print("[Step 1/6] Building local file tree...")
+
+    # Emit plan for UI
+    local_plan = {
+        "goal": question,
+        "complexity": "moderate",
+        "steps": [
+            {"id": 1, "description": "Building local file tree", "status": "pending"},
+            {"id": 2, "description": "Refining Query", "status": "pending"},
+            {"id": 3, "description": "Skeleton Analysis", "status": "pending"},
+            {"id": 4, "description": "Targeted File Retrieval", "status": "pending"},
+            {"id": 5, "description": "Keyword Search (Ripgrep)", "status": "pending"},
+            {"id": 6, "description": "Agentic Action Loop", "status": "pending"},
+        ]
+    }
+    print(f"[UI_COMMAND] agent_plan {json.dumps(local_plan)}")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 1, 'status': 'running'})}")
     project_structure = build_local_file_tree(search_path)
     file_count = len([l for l in project_structure.splitlines() if not l.startswith("...")])
     print(f"   Found {file_count} indexable files")
 
     # Step 2: Query Refinement
     print("[Step 2/6] Refining Query...")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 1, 'status': 'done'})}")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 2, 'status': 'running'})}")
     refined_data = llm.refine_user_query(
         question, history=history, project_context=project_context, file_structure=project_structure
     )
@@ -898,16 +959,39 @@ def run_local_pipeline(
     top_chunks: List[Dict] = []
 
     if is_action_request:
-        print("   [Fast-Path] Action command detected. Skipping search pipeline.")
+        print("   [Action-Path] Gathering context for action request...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 2, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'running'})}")
+
+        # Even for action requests, identify and pre-read relevant files
+        # so the agent enters the loop with context instead of wasting iterations reading
+        targeted_files = llm.identify_relevant_files(
+            query_to_use, project_structure, symbol_minimap=None
+        )
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'running'})}")
+
+        if targeted_files:
+            top_chunks = retrieve_local_files(search_path, targeted_files)
+            print(f"   [Action-Path] Pre-read {len(top_chunks)} relevant file(s): {[c['file'] for c in top_chunks]}")
+        else:
+            print("   [Action-Path] No targeted files identified, agent will read as needed")
+
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'done'})}")
     else:
         # Step 3: Skeleton Analysis (LLM identifies key files)
         print("[Step 3/6] Skeleton Analysis (identifying relevant files)...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 2, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'running'})}")
         targeted_files = llm.identify_relevant_files(
             query_to_use, project_structure, symbol_minimap=None
         )
 
         # Step 4: Targeted Retrieval (read only those files)
         print("[Step 4/6] Targeted File Retrieval...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'running'})}")
         targeted_chunks: List[Dict] = []
         if targeted_files:
             targeted_chunks = retrieve_local_files(search_path, targeted_files)
@@ -917,6 +1001,8 @@ def run_local_pipeline(
 
         # Step 5: Ripgrep for keyword matches
         print("[Step 5/6] Keyword Search (Ripgrep)...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'done'})}")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'running'})}")
         searcher = ctx.searcher if ctx else SearchTool()
         queries = llm.generate_search_queries(
             query_to_use, tool="ripgrep",
@@ -976,7 +1062,12 @@ def run_local_pipeline(
 
     # Step 6: Agentic Action Loop
     print("[Step 6/6] Agentic Action Loop (Synthesizing/Editing)...")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'done'})}")
+    print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 6, 'status': 'running'})}")
     initial_context = "\n\n---\n\n".join(c["content"] for c in top_chunks)
+
+    # Action requests need more iterations (read + write per file, multiple files)
+    loop_iterations = 15 if is_action_request else 8
 
     answer = execute_action_loop(
         question=question,
@@ -986,7 +1077,7 @@ def run_local_pipeline(
         available_tools=available_tools,
         project_structure=project_structure,
         history=history,
-        max_iterations=8,
+        max_iterations=loop_iterations,
     )
     return answer, initial_context
 

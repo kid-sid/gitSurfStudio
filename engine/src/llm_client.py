@@ -346,11 +346,28 @@ class LLMClient:
                 f"{m['role'].upper()}: {m['content']}\n" for m in history[-5:]
             )
 
+        # Detect if files were actually written/edited by the agent
+        tools_made_changes = "FileEditorTool" in context and "[Success]" in context
+
+        if tools_made_changes:
+            answer_instruction = (
+                "The agent has already applied file changes to disk (see [Success] entries in context). "
+                "Summarize what was done:\n"
+                "1. List every file created or modified with a 1-line description.\n"
+                "2. Explain the overall change in 2-3 sentences.\n"
+                "3. Note any manual next steps (install deps, restart server, etc.).\n"
+                "Do NOT repeat full file contents or code patches — the files are already written."
+            )
+        else:
+            answer_instruction = (
+                "Answer the following question thoroughly using the context above.\n"
+                "Use Markdown: headings, bullet points, **bold**, and fenced code blocks where appropriate."
+            )
+
         prompt = (
             f"<conversation_history>\n{history_str}\n</conversation_history>\n\n"
             f"<context>\n{context[:18000]}\n</context>\n\n"
-            f"Answer the following question thoroughly using the context above.\n"
-            f"Use Markdown: headings, bullet points, **bold**, and fenced code blocks where appropriate.\n\n"
+            f"{answer_instruction}\n\n"
             f"Question: {question}"
         )
 

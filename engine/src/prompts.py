@@ -339,18 +339,19 @@ def answer_question_prompt(
 
     action_block = f"""
 ACTION MODE: {action_type.upper() if action_type else "EDIT"}
-You are not writing an explanation. You are producing a direct file change.
+The file changes have ALREADY been applied to disk by the agent's tool calls.
+Your job now is to SUMMARIZE what was done — do NOT output full file contents or patches.
 
 Your response MUST follow this exact structure:
 
-REASONING:
-<2-3 sentences max explaining what you are changing and why>
+## Changes Made
+<Bullet list of every file created or modified, with a 1-line description of each change>
 
-PATCH:
-<file_path>
-```language
-<complete new file content or targeted diff>
-```
+## What Was Done
+<2-3 sentences explaining the overall change and why>
+
+## Next Steps (if any)
+<Optional: any manual steps the user still needs to take, e.g. install deps, restart server>
 
 CONFIDENCE: <HIGH | MEDIUM | LOW>
 LOW_CONFIDENCE_REASON: <only if CONFIDENCE is LOW — explain what context is missing>
@@ -513,6 +514,12 @@ FILE EDITING RULES (CRITICAL — follow these strictly):
   first with read_file(). A partial rewrite will destroy code you cannot see.
 - Before editing any file, ALWAYS call FileEditorTool.read_file() to see the current
   content so you can construct an accurate target string.
+- NEVER edit the same line/region of a file twice. If you already replaced a target
+  string in a prior step, that target no longer exists in the file — it was replaced.
+  Plan ALL changes to a single file in ONE replace_in_file call with the complete
+  replacement, rather than making multiple small edits to the same area.
+- For multi-file tasks, plan your changes upfront: decide which files to create and
+  which to modify BEFORE starting. Create new files first, then modify existing ones.
 
 <conversation_history>
 {history_str}
@@ -532,20 +539,46 @@ FILE EDITING RULES (CRITICAL — follow these strictly):
 
 DECISION RULES — follow in order:
 
-1. If <accumulated_context> already contains enough information to fully answer
-   the user's request → return final_answer immediately. Do not call more tools.
+1. CLASSIFY THE REQUEST:
+   - ACTION request = user wants code created, edited, fixed, deleted, refactored,
+     added, implemented, updated, or moved (e.g. "add a navbar", "fix the bug in X",
+     "create a login page", "implement JWT", "refactor Y to use Z").
+   - QUESTION request = user wants an explanation, search, or information
+     (e.g. "how does X work?", "what is Y?", "find where Z is defined").
 
-2. If a prior tool call in <accumulated_context> returned [Error] → do not retry
-   the same tool.method with the same args. Try a different approach or answer
-   with what you have.
+2. For ACTION requests — EXECUTE, DON'T EXPLORE:
+   ALLOWED TOOLS: FileEditorTool only (read_file, write_file, replace_in_file).
+   DO NOT USE: SearchTool, SymbolPeekerTool, WebSearchTool, context7, sequential-thinking.
+   The relevant files are already in <accumulated_context>. Use them directly.
 
-3. If you have already called the same tool.method with the same or similar args
-   in a prior step → do NOT repeat it. It will return the same result. This also
-   applies to alias names (e.g. mcp__context7__resolve-library-id and
-   resolve_library_id are the SAME tool). Instead, USE the data from the prior
-   observation to call a DIFFERENT tool or return final_answer.
+   WORKFLOW — follow this exact sequence:
+   a) PLAN: On your first iteration, output your thought listing ALL files you will
+      create or modify. Example thought: "I will: 1) create engine/src/auth.py,
+      2) modify engine/server.py to add imports and middleware, 3) update requirements.txt"
+   b) CREATE new files first using FileEditorTool.write_file() — one call per file.
+      Write complete, production-ready code. Do NOT write skeleton/placeholder code.
+   c) MODIFY existing files using FileEditorTool.replace_in_file() — use the file
+      content from <accumulated_context> to find exact target strings.
+      If a file you need is NOT in <accumulated_context>, read it first with read_file().
+   d) FINISH: Only return final_answer AFTER all files are created and modified.
+      The final_answer should summarize what you did, not contain code.
 
-4. If this is the final iteration → return final_answer regardless of confidence.
+   CRITICAL RULES:
+   - Make ONE call per iteration. Do not return final_answer until ALL files are done.
+   - Never edit the same region of a file twice — plan ALL changes to one file in a
+     single replace_in_file call.
+   - Do NOT re-read files that are already in <accumulated_context>.
+
+3. For QUESTION requests:
+   - If <accumulated_context> already contains enough information to fully answer
+     the user's request → return final_answer immediately. Do not call more tools.
+
+4. If a prior tool call returned [Error] → do not retry with the same args. Try a
+   different approach or answer with what you have.
+
+5. Do NOT call the same tool.method with the same or similar args as a prior step.
+
+6. If this is the final iteration → return final_answer regardless of confidence.
    State what you found and what remains unknown.
 
 MCP TOOL ROUTING — use these external tools when the built-in tools are insufficient:
@@ -597,8 +630,9 @@ REMINDER: For ALL mcp__* tools, set "method": "execute". Never use the tool's na
 {"" if not is_last else """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🚨 FINAL ITERATION — THIS OVERRIDES ALL OTHER RULES 🚨
-You MUST return {{"action": "final_answer"}} right now.
-Do NOT call any tool. Do NOT wait for more information.
+- If this is an ACTION request and you have NOT yet called FileEditorTool to
+  make the change → use this iteration to call FileEditorTool NOW.
+- Otherwise, return {{"action": "final_answer"}} right now.
 Synthesize everything in <accumulated_context> into your best answer.
 If context is incomplete, state what you know and what was unavailable.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

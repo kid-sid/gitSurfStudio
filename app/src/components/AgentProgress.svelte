@@ -154,6 +154,8 @@
 
   .steps-list {
     padding: 4px 0;
+    max-height: 200px;
+    overflow-y: auto;
   }
 
   .step {
