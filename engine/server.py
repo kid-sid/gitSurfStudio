@@ -26,7 +26,7 @@ if platform.system() == "Windows":
     except Exception:
         pass # Fallback for old/stripped environments
 # ───────────────────────────────────────────────────────────────────────
-from typing import Optional, List, Dict, Any, Callable, cast
+from typing import Optional, Any, Callable, cast
 from contextlib import redirect_stdout
 import queue
 from dotenv import load_dotenv
@@ -38,39 +38,35 @@ if not load_dotenv():
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
-from pydantic import BaseModel, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from src.logger import get_logger
+from src.models import (
+    ChatRequest, IndexRequest, InitRequest, AutocompleteRequest, WriteRequest,
+    RestoreRequest, CompleteRequest, GitStageRequest,
+    GitCommitRequest, GitForkRequest, GitCheckoutRequest, GitStashRequest,
+    GitDiscardRequest, MkdirRequest, RenameRequest, LintRequest,
+    NewSessionRequest, AgentRollbackRequest, AgentRespondRequest,
+    HealthResponse, InitResponse, ReadResponse, WriteResponse,
+    GitStatusResponse, GitMessageResponse, BranchResponse, SymbolResponse,
+    AutocompleteResponse,
+)
 
 logger = get_logger("server")
 
 # Ensure engine modules are importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from src.engine_state import state, _safe_path
+from src.tool_registry import AVAILABLE_TOOLS, register_tools, start_mcp_background
 from src.llm_client import LLMClient
 from src.history_manager import HistoryManager
 from src.memory.supabase_memory import SupabaseMemory
 from src.memory.chat_memory import ChatMemory
-from src.tools.file_editor_tool import FileEditorTool
-from src.tools.search_tool import SearchTool
-from src.tools.web_tool import WebSearchTool
-from src.tools.repo_manager import RepoManager
-from src.tools.git_tool import GitTool
-from src.tools.editor_ui_tool import EditorUITool
-from src.tools.symbol_extractor import SymbolExtractor
-from src.tools.symbol_peeker import SymbolPeeker
-from src.tools.find_by_name_tool import FindByNameTool
-from src.tools.list_files_tool import ListFilesTool
-from src.tools.notify_user_tool import NotifyUserTool
-from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, run_agent_pipeline, PipelineContext
-from src.security import PromptGuard, TopicGuard
+from src.orchestrator import run_local_pipeline, run_agent_pipeline, PipelineContext
+from src.security import TopicGuard
 from src.security.supabase_logger import log_security_event
-from src.mcp.client_manager import MCPClientManager
-from src.mcp.tool_proxy import MCPToolProxy
-from src.tools.browser_tool import BrowserTool
-from src.tools.terminal_tool import TerminalTool
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -89,425 +85,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class EngineState:
-    def __init__(self):
-        self._lock = threading.Lock()  # guards _ensure_initialized
-        self.llm: Optional[LLMClient] = None
-        self.history: Optional[HistoryManager] = None
-        self.pipeline_ctx: Optional[PipelineContext] = None
-        self.agent_tools: Dict = {}
-        self.workspace_path: Optional[str] = None
-        self.project_context: str = ""
-        self.git_tool: Optional[GitTool] = None
-        self.github_token: Optional[str] = None
-        self.repo_manager = RepoManager(
-            cache_dir=os.path.join(os.path.dirname(__file__), ".cache")
-        )
-        self.symbol_extractor = SymbolExtractor(
-            cache_dir=os.path.join(os.path.dirname(__file__), ".cache", "symbols")
-        )
-        self._symbols_cache: Dict[str, tuple] = {}  # path -> (symbols_dict, mtime)
-        self.prompt_guard = PromptGuard()
-        self.topic_guard: Optional[TopicGuard] = None  # wired after LLM init
-        self.supabase_memory = SupabaseMemory()
-        self._pending_memory_save: Optional[Dict] = None  # set by /init when reindex needed
-        self.chat_memory: Optional[ChatMemory] = None     # wired after LLM init
-        self.mcp_manager: Optional[MCPClientManager] = None
-        self.mcp_ready: bool = False
-        self.available_tools: str = ""  # populated after AVAILABLE_TOOLS is defined below
-        self.terminal_tool: Optional[TerminalTool] = None
-        self.active_changesets: Dict[str, Any] = {}  # changeset_id -> changeset dict
-        self.active_executor = None  # current AgentExecutor (for cancel/respond)
 
-    def get_active_token(self) -> Optional[str]:
-        return self.github_token or os.getenv("GITHUB_TOKEN")
-
-state = EngineState()
-
-
-def _safe_path(workspace: str, user_path: str) -> str:
-    """
-    Resolve user_path and assert it lives inside workspace.
-    Uses realpath() to follow symlinks before comparing, preventing
-    symlink-based escapes and classic ../../../ traversal attacks.
-    Raises HTTP 403 if the resolved path is outside the workspace.
-    """
-    workspace_real = os.path.realpath(workspace) + os.sep
-    # If user_path is relative, resolve it against the workspace (not CWD)
-    if not os.path.isabs(user_path):
-        user_path = os.path.join(workspace, user_path)
-    resolved = os.path.realpath(user_path)
-    # Append sep before comparing so the workspace root itself passes the check
-    # (e.g. resolved == workspace without trailing sep would otherwise be rejected)
-    if not (resolved + os.sep).startswith(workspace_real):
-        raise HTTPException(status_code=403, detail="Path outside of workspace")
-    return resolved
-
-
-class ChatRequest(BaseModel):
-    query: str
-    path: str
-    history: Optional[List[Dict[str, str]]] = []
-    user_id: Optional[str] = None   # Supabase auth user ID, passed by frontend
-    agent_mode: bool = False        # True = Plan→Execute→Verify pipeline
-
-    @field_validator("query")
-    @classmethod
-    def query_not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("query cannot be empty")
-        if len(v) > 20_000:
-            raise ValueError("query exceeds maximum length of 20,000 characters")
-        return v
-
-    @field_validator("path")
-    @classmethod
-    def path_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("path cannot be empty")
-        return v
-
-
-class IndexRequest(BaseModel):
-    path: str
-
-    @field_validator("path")
-    @classmethod
-    def path_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("path cannot be empty")
-        return v
-
-
-class InitRequest(BaseModel):
-    input: str
-    user_id: Optional[str] = None   # Supabase auth user ID (for persistent memory)
-
-    @field_validator("input")
-    @classmethod
-    def input_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("input cannot be empty")
-        return v
-
-
-class AutocompleteRequest(BaseModel):
-    code_context: str
-    file_path: str
-    path: str
-
-    @field_validator("code_context")
-    @classmethod
-    def context_max_length(cls, v: str) -> str:
-        if len(v) > 100_000:
-            raise ValueError("code_context exceeds maximum length of 100,000 characters")
-        return v
-
-
-class WriteRequest(BaseModel):
-    path: str
-    content: str
-
-    @field_validator("path")
-    @classmethod
-    def path_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("path cannot be empty")
-        return v
-
-    @field_validator("content")
-    @classmethod
-    def content_max_size(cls, v: str) -> str:
-        if len(v.encode("utf-8")) > 10 * 1024 * 1024:  # 10 MB
-            raise ValueError("content exceeds maximum size of 10 MB")
-        return v
-
-class RestoreRequest(BaseModel):
-    path: str
-
-class CompleteRequest(BaseModel):
-    path: str
-    prefix: str
-    suffix: str
-    language: str = "plaintext"
-
-    @field_validator("path")
-    @classmethod
-    def path_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("path cannot be empty")
-        return v
-
-
-class GitStatusRequest(BaseModel):
-    path: str
-
-class GitStageRequest(BaseModel):
-    path: str
-    files: List[str]
-
-    @field_validator("files")
-    @classmethod
-    def files_not_empty(cls, v: List[str]) -> List[str]:
-        if not v:
-            raise ValueError("files list cannot be empty")
-        return v
-
-
-class GitCommitRequest(BaseModel):
-    path: str
-    message: str
-
-    @field_validator("message")
-    @classmethod
-    def message_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("commit message cannot be empty")
-        return v
-
-
-class GitForkRequest(BaseModel):
-    path: str
-    repo_name: str
-
-
-# ── Response Models (for OpenAPI docs) ──────────────────────────────
-
-class HealthResponse(BaseModel):
-    status: str
-    workspace: Optional[str]
-
-class InitResponse(BaseModel):
-    status: str
-    workspace_path: str
-    has_project_context: bool
-    is_github: bool
-
-class ReadResponse(BaseModel):
-    content: str
-
-class WriteResponse(BaseModel):
-    status: str
-    message: str
-
-class GitStatusResponse(BaseModel):
-    status: List[Dict[str, str]]
-
-class GitMessageResponse(BaseModel):
-    message: str
-
-class BranchResponse(BaseModel):
-    current: Optional[str]
-    branches: List[str]
-
-class SymbolResponse(BaseModel):
-    path: str
-    symbols: List[Dict]
-
-class AutocompleteResponse(BaseModel):
-    completion: str
-
-# ────────────────────────────────────────────────────────────────────
-
-class SymbolPeekerTool:
-    """
-    Lazy wrapper around SymbolPeeker.
-    Builds the symbol index on first call (uses cache when available).
-    """
-
-    def __init__(self, pipeline_ctx: "PipelineContext", workspace_path: str):
-        self._ctx = pipeline_ctx
-        self._workspace = workspace_path
-        self._peeker: Optional[SymbolPeeker] = None
-
-    def _ensure_peeker(self):
-        if self._peeker is not None:
-            return
-        index = self._ctx.sym_extractor.extract_from_directory(self._workspace)
-        self._peeker = SymbolPeeker(index, self._workspace)
-
-    def peek_symbol(self, symbol_name: str) -> list:
-        """
-        Returns all definitions of symbol_name found in the workspace.
-        Each entry: {file, type, name, start_line, end_line, content}
-        """
-        self._ensure_peeker()
-        return self._peeker.peek_symbol(symbol_name)
-
-
-AVAILABLE_TOOLS = """
-Tool: FileEditorTool
-Description: Read, write, modify, or delete files inside the project directory.
-Methods:
-  - read_file(rel_path, start_line=None, end_line=None)
-  - write_file(rel_path, content)
-  - replace_in_file(rel_path, target, replacement, allow_multiple=False)
-    NOTE: target must match exactly once unless allow_multiple=True.
-    On ambiguity, returns the line numbers of all matches to help refine the target.
-  - multi_replace_file_content(rel_path, replacement_chunks)
-    Replaces multiple non-contiguous chunks in a file. replacement_chunks is a list of dicts with 'targetContent' and 'replacementContent' keys.
-  - delete_file(rel_path)
-
-Tool: FindByNameTool
-Description: Search for files using glob patterns.
-Methods:
-  - find_by_name(pattern, type="any", max_depth=None, full_path=False)
-    Type can be file, directory, or any.
-
-Tool: ListFilesTool
-Description: List files and folders.
-Methods:
-  - list_dir(rel_path="."): Lists shallow contents of a directory.
-  - list_recursive(rel_path="."): Lists all relative paths recursively.
-
-Tool: NotifyUserTool
-Description: Pause agent execution and request human feedback or approval.
-Methods:
-  - notify_user(message, paths_to_review=None, blocked_on_user=True)
-    Blocks execution and returns string response from user.
-
-Tool: EditorUITool
-Description: Control the IDE user interface.
-Methods:
-  - open_file(rel_path)
-    Opens the specified file in an editor tab.
- 
-Tool: GitTool
-Description: Handle local Git operations (status, stage, commit, diff).
-Methods:
-  - get_status()
-  - stage_files(files)
-  - commit(message)
-  - get_diff(file_path=None)
-
-Tool: SearchTool
-Description: Search for text patterns in the codebase using ripgrep.
-Methods:
-  - search(query, search_path=".")
-  - search_and_chunk(query, search_path=".", context_lines=10)
-
-Tool: WebSearchTool
-Description: Search the web or fetch URL content for documentation/errors.
-Methods:
-  - search(query, num_results=5)
-  - fetch_url(url)
-
-Tool: SymbolPeekerTool
-Description: Peek the definition of any function or class by name (like F12 in VS Code). Returns the full source block, file path, and line range. Use this to inspect a symbol's current implementation before editing it — avoids reading entire files.
-Methods:
-  - peek_symbol(symbol_name): Returns [{file, type, name, start_line, end_line, content}]
-
-Tool: BrowserTool
-Description: High-level browser automation for verifying pages, testing interactions, and debugging client-side issues. Uses Playwright under the hood. Prefer this over raw mcp__playwright__* calls for multi-step browser workflows.
-Methods:
-  - verify_page(url, checks=None, wait_ms=2000)
-    Navigate to URL, capture snapshot + screenshot, optionally check for expected text.
-    checks: JSON array of strings, e.g. '["Submit button", "Welcome"]'
-  - test_interaction(url, steps)
-    Execute a sequence of browser actions and report pass/fail per step.
-    steps: JSON array, e.g. '[{"action":"click","element":"Login"},{"action":"snapshot","expect":"Dashboard"}]'
-  - debug_page(url)
-    Capture snapshot, screenshot, and console messages for debugging.
-  - scrape_rendered(url)
-    Fetch content from a JavaScript-rendered page (use instead of WebSearchTool.fetch_url for SPAs).
-
-Tool: TerminalTool
-Description: Execute shell commands safely in the workspace (tests, linting, builds).
-Methods:
-  - run_command(command, timeout_sec=30, cwd=None)
-    Run a shell command. Only safe commands are allowed (pytest, ruff, npm, node, etc.).
-  - run_test(test_path=None)
-    Run project tests (auto-detects pytest or npm test).
-  - run_lint(file_path=None)
-    Run linter (ruff for Python, eslint for JS/TS/Svelte).
-"""
-
-# Seed the default — _init_mcp_background will append MCP tools once servers are ready
+# Seed the default tool descriptions
 state.available_tools = AVAILABLE_TOOLS
-
-
-def _build_mcp_schema_hint(input_schema: dict) -> str:
-    """
-    Build a rich, human-readable parameter hint for an MCP tool.
-    Marks required params with *, optional with ?, includes descriptions and enum values.
-    Example: url*: string "The URL to navigate to", wait_until?: enum[load|domcontentloaded]
-    """
-    props = input_schema.get("properties", {})
-    required = set(input_schema.get("required", []))
-    if not props:
-        return ""
-    parts = []
-    for k, v in props.items():
-        req_marker = "*" if k in required else "?"
-        typ = v.get("type", "any")
-        if "enum" in v:
-            typ = "enum[" + "|".join(str(e) for e in v["enum"]) + "]"
-        elif typ == "object" and "properties" in v:
-            nested = ", ".join(
-                f"{nk}: {nv.get('type', 'any')}" for nk, nv in v["properties"].items()
-            )
-            typ = f"object{{{nested}}}"
-        hint = f"{k}{req_marker}: {typ}"
-        desc = v.get("description", "")
-        if desc:
-            hint += f' "{desc[:60]}"'
-        parts.append(hint)
-    return ", ".join(parts)
-
-
-def _init_mcp_background(config_path: str) -> None:
-    """
-    Runs in a daemon thread. Connects to all MCP servers in parallel, then
-    registers proxies into state.agent_tools and updates state.available_tools.
-    The /init endpoint returns immediately; this runs concurrently.
-    """
-    try:
-        manager = MCPClientManager()
-        manager.initialize(config_path)
-
-        mcp_tools_desc = ""
-        for tool_info in manager.list_all_tools():
-            full_key = f"mcp__{tool_info['server']}__{tool_info['name']}"
-            # Bug 1A: also register a shorthand alias (hyphens → underscores)
-            shorthand = tool_info["name"].replace("-", "_")
-            proxy = MCPToolProxy(
-                manager=manager,
-                server_name=tool_info["server"],
-                tool_name=tool_info["name"],
-                description=tool_info["description"],
-                input_schema=tool_info.get("input_schema", {}),
-            )
-            # Bug 2: rich schema hint (* = required, ? = optional)
-            schema_hint = _build_mcp_schema_hint(tool_info.get("input_schema", {}))
-            with state._lock:
-                state.agent_tools[full_key] = proxy
-                state.agent_tools[shorthand] = proxy   # alias
-
-            mcp_tools_desc += (
-                f"\nTool: {full_key}  (alias: {shorthand})\n"
-                f"Description: {tool_info['description']}\n"
-                f"Methods:\n"
-                f"  - execute({schema_hint})\n"
-                f"  NOTE: method must always be \"execute\"\n"
-            )
-
-        with state._lock:
-            state.mcp_manager = manager
-            if mcp_tools_desc:
-                state.available_tools = (
-                    AVAILABLE_TOOLS
-                    + "\n\n## MCP Tools (* = required, ? = optional)\n"
-                    + mcp_tools_desc
-                )
-            state.mcp_ready = True
-
-        tool_count = len(manager.list_all_tools())
-        logger.info("[MCP] Ready — %d tool(s) registered.", tool_count)
-    except Exception as exc:
-        logger.error("[MCP] Background init failed: %s", exc)
-        with state._lock:
-            state.mcp_ready = True   # mark ready anyway so status endpoint doesn't hang
 
 
 def _ensure_initialized(workspace_path: str):
@@ -552,48 +132,17 @@ def _ensure_initialized(workspace_path: str):
                 break
         # ─────────────────────────────────────────────────────────────
 
-        file_editor = FileEditorTool(root_path=workspace_path)
-        git_tool = GitTool(root_path=workspace_path)
-        editor_ui = EditorUITool(root_path=workspace_path)
-        searcher = SearchTool()
-        web_tool = WebSearchTool()
-
         state.pipeline_ctx = PipelineContext(
             search_path=workspace_path,
             rebuild_index=False,
         )
 
-        terminal_tool = TerminalTool(workspace_path=workspace_path)
-        state.terminal_tool = terminal_tool
+        # Register all agent tools
+        register_tools(state, workspace_path, state.pipeline_ctx)
 
-        state.agent_tools = {
-            "FileEditorTool": file_editor,
-            "GitTool": git_tool,
-            "EditorUITool": editor_ui,
-            "SearchTool": searcher,
-            "WebSearchTool": web_tool,
-            "SymbolPeekerTool": SymbolPeekerTool(state.pipeline_ctx, workspace_path),
-            "BrowserTool": BrowserTool(tools_getter=lambda: state.agent_tools),
-            "TerminalTool": terminal_tool,
-            "FindByNameTool": FindByNameTool(workspace_path),
-            "ListFilesTool": ListFilesTool(workspace_path),
-            "NotifyUserTool": NotifyUserTool(
-                ask_callback=lambda msg, opts=None: state.active_executor._ask_user(msg, opts) if state.active_executor else "ok"
-            ),
-        }
-        state.git_tool = git_tool
-
-        # ── MCP tool integration (background — non-blocking) ─────────────────
-        state.mcp_ready = False
+        # Start MCP tool discovery in background
         _mcp_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_config.json")
-        mcp_thread = threading.Thread(
-            target=_init_mcp_background,
-            args=(_mcp_config,),
-            daemon=True,
-            name="mcp-init",
-        )
-        mcp_thread.start()
-        # ─────────────────────────────────────────────────────────────────────
+        start_mcp_background(state, _mcp_config)
 
 
 @app.on_event("shutdown")
@@ -781,10 +330,6 @@ async def git_branch(path: str):
         raise HTTPException(status_code=400, detail="GitTool not initialized")
     return git_tool.get_branches()
 
-class GitCheckoutRequest(BaseModel):
-    path: str
-    branch: str
-
 @app.post("/git/checkout")
 async def git_checkout(req: GitCheckoutRequest):
     _ensure_initialized(req.path)
@@ -797,9 +342,6 @@ async def git_checkout(req: GitCheckoutRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-class GitStashRequest(BaseModel):
-    path: str
-
 @app.post("/git/stash")
 async def git_stash(req: GitStashRequest):
     _ensure_initialized(req.path)
@@ -811,10 +353,6 @@ async def git_stash(req: GitStashRequest):
         return {"message": result}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-class GitDiscardRequest(BaseModel):
-    path: str
-    file: str
 
 @app.post("/git/discard")
 async def git_discard(req: GitDiscardRequest):
@@ -1024,22 +562,6 @@ async def write_file(req: WriteRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-class MkdirRequest(BaseModel):
-    path: str
-
-    @field_validator("path")
-    @classmethod
-    def path_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("path cannot be empty")
-        return v
-
-
-class RenameRequest(BaseModel):
-    old_path: str
-    new_path: str
-
-
 @app.post("/mkdir")
 async def mkdir(req: MkdirRequest):
     """Creates a directory on local disk."""
@@ -1181,19 +703,6 @@ async def complete_code(req: CompleteRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-class LintRequest(BaseModel):
-    file_path: str
-    content: str
-    workspace: str = ""
-
-    @field_validator("content")
-    @classmethod
-    def content_max_size(cls, v: str) -> str:
-        if len(v.encode("utf-8")) > 1 * 1024 * 1024:  # 1 MB cap for linting
-            raise ValueError("content too large for linting")
-        return v
-
-
 @app.post("/lint")
 @limiter.limit("120/minute")
 async def lint_code(request: Request, req: LintRequest):
@@ -1209,15 +718,6 @@ async def lint_code(request: Request, req: LintRequest):
 
 
 # ── Chat Session Endpoints ───────────────────────────────────────────────────
-
-class SessionRequest(BaseModel):
-    user_id: str
-    repo_identifier: str
-
-class NewSessionRequest(BaseModel):
-    user_id: str
-    repo_identifier: str
-    title: Optional[str] = None
 
 @app.post("/chat/sessions")
 async def create_chat_session(req: NewSessionRequest):
@@ -1635,15 +1135,6 @@ async def terminal_ws(websocket: WebSocket, cwd: Optional[str] = None):
 
 
 # ── Agent API Routes ──────────────────────────────────────────────────────────
-
-
-class AgentRollbackRequest(BaseModel):
-    changeset_id: str
-    file_path: Optional[str] = None  # None = rollback all
-
-
-class AgentRespondRequest(BaseModel):
-    response: str
 
 
 @app.post("/agent/rollback")
