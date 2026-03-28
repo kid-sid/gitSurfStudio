@@ -712,14 +712,21 @@ PLANNING RULES:
    If step B needs information from step A's output, include A's id in B's depends_on.
    Steps with no dependencies can potentially run in parallel.
 
-4. VERIFICATION
+4. GITSURF WORKFLOW (CRITICAL)
+   You MUST structure your plan perfectly following the below lifecycle:
+   - Phase 1 (Planning): Add a step to use FileEditorTool to write 'implementation_plan.md' describing all changes.
+   - Phase 1 (Approval): Add a step to use NotifyUserTool.notify_user to ask for approval on the plan. This step MUST depend on the plan generation step.
+   - Phase 2 (Execution): Write/edit the required files using FileEditorTool (write_file, replace_in_file, multi_replace_file_content). These must depend on the approval step.
+   - Phase 3 (Verification): Verify logic and use FileEditorTool to write 'walkthrough.md' detailing the accomplishments.
+
+5. VERIFICATION
    For steps that modify code, add a verification field:
    - "run_lint" — run linter after the edit
    - "run_test" — run tests after the edit
    - "read_back" — read the file back to confirm the change
    Set to null for read-only steps.
 
-5. COMPLEXITY CLASSIFICATION
+6. COMPLEXITY CLASSIFICATION
    - "simple" — 1-2 file changes, straightforward edits
    - "moderate" — 3-5 files, some coordination needed
    - "complex" — 6+ files, refactoring, or cross-cutting changes

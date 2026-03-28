@@ -61,6 +61,9 @@ from src.tools.git_tool import GitTool
 from src.tools.editor_ui_tool import EditorUITool
 from src.tools.symbol_extractor import SymbolExtractor
 from src.tools.symbol_peeker import SymbolPeeker
+from src.tools.find_by_name_tool import FindByNameTool
+from src.tools.list_files_tool import ListFilesTool
+from src.tools.notify_user_tool import NotifyUserTool
 from src.orchestrator import run_code_aware_pipeline, run_local_pipeline, run_agent_pipeline, PipelineContext
 from src.security import PromptGuard, TopicGuard
 from src.security.supabase_logger import log_security_event
@@ -342,7 +345,27 @@ Methods:
   - replace_in_file(rel_path, target, replacement, allow_multiple=False)
     NOTE: target must match exactly once unless allow_multiple=True.
     On ambiguity, returns the line numbers of all matches to help refine the target.
+  - multi_replace_file_content(rel_path, replacement_chunks)
+    Replaces multiple non-contiguous chunks in a file. replacement_chunks is a list of dicts with 'targetContent' and 'replacementContent' keys.
   - delete_file(rel_path)
+
+Tool: FindByNameTool
+Description: Search for files using glob patterns.
+Methods:
+  - find_by_name(pattern, type="any", max_depth=None, full_path=False)
+    Type can be file, directory, or any.
+
+Tool: ListFilesTool
+Description: List files and folders.
+Methods:
+  - list_dir(rel_path="."): Lists shallow contents of a directory.
+  - list_recursive(rel_path="."): Lists all relative paths recursively.
+
+Tool: NotifyUserTool
+Description: Pause agent execution and request human feedback or approval.
+Methods:
+  - notify_user(message, paths_to_review=None, blocked_on_user=True)
+    Blocks execution and returns string response from user.
 
 Tool: EditorUITool
 Description: Control the IDE user interface.
@@ -552,6 +575,11 @@ def _ensure_initialized(workspace_path: str):
             "SymbolPeekerTool": SymbolPeekerTool(state.pipeline_ctx, workspace_path),
             "BrowserTool": BrowserTool(tools_getter=lambda: state.agent_tools),
             "TerminalTool": terminal_tool,
+            "FindByNameTool": FindByNameTool(workspace_path),
+            "ListFilesTool": ListFilesTool(workspace_path),
+            "NotifyUserTool": NotifyUserTool(
+                ask_callback=lambda msg, opts=None: state.active_executor._ask_user(msg, opts) if state.active_executor else "ok"
+            ),
         }
         state.git_tool = git_tool
 
