@@ -43,17 +43,27 @@ FIELD INSTRUCTIONS:
 
 "intent": A single, concise verb phrase describing the user's technical goal (e.g., "Add tab switching to the Svelte frontend"). Derive this from both the request AND the project context. Max 15 words.
 
-"refined_question": A precise, jargon-correct restatement of the user's question, correcting typos and removing ambiguity. Should be answerable by a code search engine. Max 25 words.
+"refined_question": A precise, jargon-correct restatement of the user's request, correcting typos and removing ambiguity. Keep the same imperative form if the user gave a command (e.g., "Implement JWT auth" stays imperative, do NOT rephrase it as a question like "How can I...?"). Max 25 words.
 
 "keywords": An array of 5–10 technical search terms ranked by relevance. Prioritize:
-  1. Exact symbol names visible in <file_structure> (e.g., "App.svelte", "sidebar.js")
-  2. Framework/language-specific terms inferred from project context (e.g., "svelte store", "writable")
-  3. General programming concepts as a fallback (e.g., "tab component", "state management")
+  1. The core nouns/concepts from the user's ACTUAL question — these MUST come first.
+     Example: "What skills are available?" → first keyword MUST be "skills".
+     Example: "How is auth implemented?" → first keyword MUST be "auth".
+  2. Exact symbol names or folder names visible in <file_structure> that match
+     (e.g., "skills/", "auth.py", "sidebar.js")
+  3. Framework/language-specific terms inferred from project context
+  4. General programming concepts as a fallback
   Do NOT fabricate symbol names not present in the file structure.
+  Do NOT replace the user's search terms with project-description terms.
 
-"is_action_request": true ONLY if the user is requesting a direct file mutation (edit, create, delete, rename, refactor). Set to false for all questions, how-tos, and explanations.
-
-"is_overview_question": true ONLY if the user wants high-level information about THIS PROJECT that can be answered from the README or project docs — e.g. "what does this do?", "explain the project", "give me an overview", "what is this?", "describe the architecture", "how do I run this?", "how to install?", "how to set up?", "how to get started?". Set to false if the question is about an EXTERNAL library, framework, or technology (e.g. "how does $state work in Svelte 5?", "what is FastAPI dependency injection?" — these require external docs, NOT the project README). Set to false for anything targeting a specific file, function, class, bug, or feature.
+"is_action_request": true if the user wants code to be created, edited, or changed in any way.
+  Imperative verbs are ALWAYS action requests: "implement", "add", "create", "build",
+  "set up", "integrate", "make", "fix", "refactor", "update", "delete", "rename",
+  "write", "install", "configure", "move", "extract", "split", "merge", "convert".
+  Example action requests: "Implement JWT auth", "Add a navbar", "Create a login page",
+  "Build a REST API", "Set up database models", "Fix the bug in X".
+  Set to false ONLY for pure questions seeking explanation or information — e.g.
+  "how does X work?", "what is Y?", "explain Z", "where is X defined?".
 
 "target_files": An array of filenames from <file_structure> most likely relevant to this request. Return an empty array [] if none are identifiable.
 
@@ -67,7 +77,6 @@ EXPECTED OUTPUT FORMAT:
   "refined_question": "string (max 25 words)",
   "keywords": ["str1", "str2", "..."],
   "is_action_request": boolean,
-  "is_overview_question": boolean,
   "target_files": ["filename1", "filename2"],
   "action_type": "edit" | "create" | "delete" | "rename" | "refactor" | null,
   "direct_tool_call": {{
@@ -565,13 +574,27 @@ DECISION RULES — follow in order:
 
    CRITICAL RULES:
    - Make ONE call per iteration. Do not return final_answer until ALL files are done.
+   - NEVER rewrite a file you already created. If you already used write_file() on a
+     file, that file is DONE — move on to the next file in your plan. If you need to
+     fix something in it, use replace_in_file() instead. Rewriting wastes iterations.
+   - PROGRESS THROUGH YOUR PLAN — each iteration must advance to a DIFFERENT step.
+     If iteration 1 creates file A, iteration 2 must create file B or modify file C.
+     Never redo the same step with a "better" version.
    - Never edit the same region of a file twice — plan ALL changes to one file in a
      single replace_in_file call.
    - Do NOT re-read files that are already in <accumulated_context>.
 
-3. For QUESTION requests:
-   - If <accumulated_context> already contains enough information to fully answer
-     the user's request → return final_answer immediately. Do not call more tools.
+3. For QUESTION requests — VERIFY CONTEXT BEFORE ANSWERING:
+   a) Scan <project_structure> for files or folders whose names relate to the
+      user's question topic. Examples: user asks about "skills" → look for a
+      skills/ folder; user asks about "auth" → look for auth.py or auth/ directory.
+   b) If such files/folders exist but their content is NOT in <accumulated_context>,
+      use FileEditorTool.read_file() or SearchTool.search() to examine them BEFORE
+      returning final_answer.
+   c) Do NOT assume README or overview content is sufficient when specific source
+      files, config files, or dedicated directories exist for the topic.
+   d) Only return final_answer when your context includes the actual relevant source
+      files — not just summary documents that mention the topic in passing.
 
 4. If a prior tool call returned [Error] → do not retry with the same args. Try a
    different approach or answer with what you have.

@@ -33,6 +33,7 @@ def execute_action_loop(
     # ── Loop detection state ───────────────────────────────────────────
     _exact_calls: Dict[str, int] = {}
     _method_calls: Dict[str, int] = {}
+    _file_writes: Dict[str, int] = {}  # track per-file write counts
 
     for iteration in range(1, max_iterations + 1):
         print(f"   [Iteration {iteration}/{max_iterations}] Thinking...")
@@ -64,6 +65,7 @@ def execute_action_loop(
 
         if action_type == "final_answer":
             print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 100 + iteration, 'status': 'done'})}")
+            print(f"[UI_COMMAND] agent_action {json.dumps({'iteration': iteration, 'total': max_iterations, 'thought': thought, 'action': 'final_answer', 'status': 'done'})}")
             answer = llm.stream_final_answer(
                 question, context_for_llm, history=history
             )
@@ -74,6 +76,19 @@ def execute_action_loop(
             method = decision.get("method")
             kwargs = decision.get("args", {})
             print(f"   Action -> {tool_name}.{method}({kwargs})")
+
+            # Emit structured tool call event (running)
+            _action_event = {
+                "iteration": iteration,
+                "total": max_iterations,
+                "thought": thought,
+                "action": "tool_call",
+                "tool": tool_name,
+                "method": method,
+                "args": kwargs,
+                "status": "running",
+            }
+            print(f"[UI_COMMAND] agent_action {json.dumps(_action_event)}")
 
             # ── Loop detection ──────────────────────────────────────────
             _norm_name = (tool_name or "").replace("mcp__context7__", "").replace("mcp__", "").replace("-", "_")
@@ -139,6 +154,21 @@ def execute_action_loop(
                 action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}")
                 continue
 
+            # ── Per-file write guard (catches rewriting the same file) ──
+            if method == "write_file":
+                _write_path = kwargs.get("rel_path", kwargs.get("path", ""))
+                _file_writes[_write_path] = _file_writes.get(_write_path, 0) + 1
+                if _file_writes[_write_path] > 2:
+                    print(f"   [LoopGuard] File rewrite block — {_write_path} written {_file_writes[_write_path]}x")
+                    observation = (
+                        f"[LoopGuard] BLOCKED — you already wrote '{_write_path}' {_file_writes[_write_path] - 1} time(s). "
+                        f"The file is done. Move on to the NEXT file in your plan, or use "
+                        f"replace_in_file() for targeted edits, or provide your final_answer."
+                    )
+                    action_str = f"Action taken: {tool_name}.{method}({kwargs})\nObservation: {observation}"
+                    action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}")
+                    continue
+
             # Act: Generic tool dispatch
             tool_instance = tools.get(tool_name)
             if tool_instance:
@@ -156,6 +186,10 @@ def execute_action_loop(
             obs_preview = str(observation)[:200]
             print(f"   Observation: {obs_preview}...")
             print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 100 + iteration, 'status': 'done'})}")
+
+            # Emit structured tool result event (done/error)
+            _result_status = "error" if str(observation).startswith("[Error]") else "done"
+            print(f"[UI_COMMAND] agent_action {json.dumps({'iteration': iteration, 'total': max_iterations, 'action': 'tool_call', 'tool': tool_name, 'method': method, 'status': _result_status, 'observation': obs_preview})}")
 
             # ── Auto-chain: resolve-library-id → query-docs ─────────────
             if "resolve" in _norm_name and "library" in _norm_name:

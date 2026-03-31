@@ -3,68 +3,17 @@ Local file system pipeline — skeleton-first search for local workspaces.
 """
 
 import os
-import re
 import json
 from typing import List, Dict, Optional
 
 from src.tools.search_tool import SearchTool
+from src.tools.glob_tool import GlobTool
 from src.tools.vector_search_tool import VectorSearchTool
 from src.tools.bm25_search_tool import BM25SearchTool
 from src.embeddings import EmbeddingClient
 from src.reranker import CrossEncoderReranker
 from src.pipelines.context import PipelineContext, reciprocal_rank_fusion
 from src.pipelines.action_loop import execute_action_loop
-
-
-# ── Tier-0 fast-path: overview / context questions ─────────────────────────────
-_OVERVIEW_PATTERNS = [
-    r'\bwhat\s+does\s+(this|the)?\s*(project|codebase|repo|code|app)\s+(do|mean|contain|provide)\b',
-    r'\bwhat\s+is\s+(this|the)\s*(project|codebase|repo|code|app)\b',
-    r'\b(explain|describe|summarize?|overview\s+of|purpose\s+of)\b.{0,60}\b(project|codebase|repo|code|app|architecture)\b',
-    r'\b(explain|describe)\s+(the\s+)?(main\s+)?(architecture|structure|design|overview|features?)\b',
-    r'\b(project|codebase|repo|app)\s+(overview|summary|purpose|goal)\b',
-    r'\btell\s+me\s+about\s+(this\s+)?(project|codebase|repo|app)\b',
-    r'\bhow\s+does\s+(this\s+)?(project|app|code|tool)\s+work\b',
-    r'\bwhat\s+can\s+(this|the)\s+(app|project|tool)\s+do\b',
-    r'\bmain\s+(purpose|goal|objective|functionality|feature)\b',
-    r'\barchitecture\s+of\s+(this|the)\s*(project|code|app|system)\b',
-    r'\bhow\s+(to|do\s+i|can\s+i)\s+(run|start|launch|execute|install|setup|set\s+up|use|get\s+started|deploy|build)\b',
-    r'\b(steps?|instructions?|guide|way)\s+(to|for)\s+(run|start|install|setup|use|deploy|build)\b',
-    r'\bhow\s+do\s+i\s+(get\s+started|run\s+it|install|set\s+this\s+up)\b',
-    r'\b(run|start|install|setup|launch)\s+(this\s+)?(project|app|code|repo|locally)\b',
-    r'\brun\s+(the\s+)?(project|app|code|server)\s+(locally|now)?\b',
-    r'\bget\s+(this\s+)?(running|started|working)\b',
-    r'^\s*(what is this|what does this do|explain this|overview|how to run|how to use|getting started)\s*\??$',
-]
-_OVERVIEW_RE = [re.compile(p, re.IGNORECASE) for p in _OVERVIEW_PATTERNS]
-
-_OVERVIEW_FILES = [
-    'README.md', 'README.rst', 'README.txt', 'README',
-    'CLAUDE.md', 'ARCHITECTURE.md', 'OVERVIEW.md', 'DESIGN.md', 'CONTRIBUTING.md',
-    'package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml', 'setup.py',
-]
-
-
-def _is_overview_question(question: str) -> bool:
-    return any(p.search(question.strip()) for p in _OVERVIEW_RE)
-
-
-def _read_overview_files(search_path: str, max_chars: int = 6000) -> str:
-    """Read README and project config files directly — no indexing needed."""
-    parts = []
-    for fname in _OVERVIEW_FILES:
-        fpath = os.path.join(search_path, fname)
-        if not os.path.isfile(fpath):
-            continue
-        try:
-            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read(max_chars)
-            parts.append(f"### {fname}\n{content}")
-            if sum(len(p) for p in parts) >= max_chars * 2:
-                break
-        except Exception:
-            pass
-    return "\n\n---\n\n".join(parts)
 
 
 # ── Local file tree helpers ────────────────────────────────────────────────────
@@ -115,7 +64,7 @@ def build_local_file_tree(root_path: str, max_files: int = 500) -> str:
 def retrieve_local_files(
     root_path: str,
     file_paths: List[str],
-    max_chars_per_file: int = 100000,
+    max_chars_per_file: int = 15000,
 ) -> List[Dict]:
     """Read files directly from the local file system (no cache needed)."""
     chunks = []
@@ -174,32 +123,6 @@ def run_local_pipeline(
     """
     print("\n[Smart Local Pipeline]")
 
-    # ── Tier-0: Overview fast-path ────────────────────────────────────────────
-    if _is_overview_question(question):
-        print("[Tier-0] Overview question detected — reading project docs directly...")
-        project_structure = build_local_file_tree(search_path)
-        overview_docs = _read_overview_files(search_path)
-        if overview_docs:
-            context_parts = []
-            if project_context:
-                context_parts.append(f"Project Summary:\n{project_context}")
-            context_parts.append(f"File Structure:\n{project_structure[:1500]}")
-            context_parts.append(overview_docs)
-            initial_context = "\n\n---\n\n".join(context_parts)
-            print(f"   [Tier-0] Using {len(initial_context)} chars from project docs. Answering directly.")
-            answer = execute_action_loop(
-                question=question,
-                initial_context=initial_context,
-                llm=llm,
-                tools=tools,
-                available_tools=available_tools,
-                project_structure=project_structure,
-                history=history,
-                max_iterations=3,
-            )
-            return answer, initial_context
-        print("   [Tier-0] No README or project docs found. Falling through to full pipeline.")
-
     # Step 1: Build local file tree
     print("[Step 1/6] Building local file tree...")
 
@@ -209,9 +132,9 @@ def run_local_pipeline(
         "steps": [
             {"id": 1, "description": "Building local file tree", "status": "pending"},
             {"id": 2, "description": "Refining Query", "status": "pending"},
-            {"id": 3, "description": "Skeleton Analysis", "status": "pending"},
-            {"id": 4, "description": "Targeted File Retrieval", "status": "pending"},
-            {"id": 5, "description": "Keyword Search (Ripgrep)", "status": "pending"},
+            {"id": 3, "description": "Searching codebase", "status": "pending"},
+            {"id": 4, "description": "Gathering context", "status": "pending"},
+            {"id": 5, "description": "Analyzing results", "status": "pending"},
             {"id": 6, "description": "Agentic Action Loop", "status": "pending"},
         ]
     }
@@ -231,34 +154,9 @@ def run_local_pipeline(
     query_to_use = refined_data.get("refined_question", question)
     expansion_keywords = refined_data.get("keywords", [])
     is_action_request = refined_data.get("is_action_request", False)
-    is_overview_question = refined_data.get("is_overview_question", False)
     direct_tool_call = refined_data.get("direct_tool_call")
     print(f"   Refined to: \"{query_to_use}\"")
     print(f"   Keywords: {expansion_keywords[:5]}")
-
-    # ── Tier-1: LLM-classified overview fast-path ─────────────────────────────
-    if is_overview_question:
-        print("   [Tier-1] LLM classified as overview question. Reading project docs...")
-        overview_docs = _read_overview_files(search_path)
-        if overview_docs:
-            context_parts = []
-            if project_context:
-                context_parts.append(f"Project Summary:\n{project_context}")
-            context_parts.append(f"File Structure:\n{project_structure[:1500]}")
-            context_parts.append(overview_docs)
-            initial_context = "\n\n---\n\n".join(context_parts)
-            answer = execute_action_loop(
-                question=question,
-                initial_context=initial_context,
-                llm=llm,
-                tools=tools,
-                available_tools=available_tools,
-                project_structure=project_structure,
-                history=history,
-                max_iterations=3,
-            )
-            return answer, initial_context
-        print("   [Tier-1] No project docs found. Falling through to full pipeline.")
 
     if direct_tool_call:
         print(f"   [Fast-Path] Executing direct tool call: {direct_tool_call}")
@@ -298,79 +196,147 @@ def run_local_pipeline(
         print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'done'})}")
         print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'done'})}")
     else:
-        # Step 3: Skeleton Analysis
-        print("[Step 3/6] Skeleton Analysis (identifying relevant files)...")
+        # ── Step 3: Quick Search (Glob + Grep) ─────────────────────────
+        # Try lightweight file-name matching and content grep before
+        # falling back to the heavier skeleton-analysis / embedding path.
+        print("[Step 3/6] Quick Search (Glob + Grep)...")
         print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 2, 'status': 'done'})}")
         print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'running'})}")
+
+        light_chunks: List[Dict] = []
+        seen_files: set = set()
+
+        # 3a: Use target_files already identified during query refinement
+        target_files_hint = refined_data.get("target_files", [])
+        if target_files_hint:
+            tgt_chunks = retrieve_local_files(search_path, target_files_hint)
+            for c in tgt_chunks:
+                if c["file"] not in seen_files:
+                    light_chunks.append(c)
+                    seen_files.add(c["file"])
+            if light_chunks:
+                print(f"   [Target] {len(light_chunks)} file(s) from refinement: {[c['file'] for c in light_chunks]}")
+
+        # 3b: Glob for files whose *name* matches the top keywords
+        if len(light_chunks) < 5 and expansion_keywords:
+            _glob = GlobTool(search_path)
+            for kw in expansion_keywords[:3]:
+                if len(kw) < 3:
+                    continue
+                glob_matches = _glob.list_files(f"*{kw}*")
+                new_files = [
+                    f for f in glob_matches
+                    if not f.startswith("[Error]") and f not in seen_files
+                ]
+                if new_files:
+                    for c in retrieve_local_files(search_path, new_files[:3]):
+                        if c["file"] not in seen_files:
+                            light_chunks.append(c)
+                            seen_files.add(c["file"])
+            if light_chunks:
+                print(f"   [Glob] {len(light_chunks)} total after glob: {[c['file'] for c in light_chunks]}")
+
+        # 3c: Grep for top keywords in file contents
+        if len(light_chunks) < 8 and expansion_keywords:
+            _searcher = ctx.searcher if ctx else SearchTool()
+            for kw in expansion_keywords[:3]:
+                if len(kw) < 3:
+                    continue
+                results = _searcher.search_and_chunk(kw, search_path)
+                for chunk in results[:5]:
+                    if chunk["file"] not in seen_files:
+                        light_chunks.append(chunk)
+                        seen_files.add(chunk["file"])
+                    if len(light_chunks) >= 10:
+                        break
+                if len(light_chunks) >= 10:
+                    break
+            print(f"   [Grep] {len(light_chunks)} total after grep")
+
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'done'})}")
+        print(f"   [Quick Search] Found {len(light_chunks)} chunk(s). Identifying targeted files...")
+
+        # ── Step 4: Targeted file identification (always runs) ────────
+        print("[Step 4/6] Identifying targeted files...")
+        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'running'})}")
+
         targeted_files = llm.identify_relevant_files(
             query_to_use, project_structure, symbol_minimap=None
         )
-
-        # Step 4: Targeted Retrieval
-        print("[Step 4/6] Targeted File Retrieval...")
-        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 3, 'status': 'done'})}")
-        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'running'})}")
         targeted_chunks: List[Dict] = []
         if targeted_files:
             targeted_chunks = retrieve_local_files(search_path, targeted_files)
-            print(f"   Retrieved {len(targeted_chunks)} targeted file(s)")
-        else:
-            print("   No targeted files identified")
+            for c in targeted_chunks:
+                if c["file"] not in seen_files:
+                    light_chunks.append(c)
+                    seen_files.add(c["file"])
+            print(f"   [Targeted] Retrieved {len(targeted_chunks)} file(s): {[c['file'] for c in targeted_chunks]}")
 
-        # Step 5: Ripgrep
-        print("[Step 5/6] Keyword Search (Ripgrep)...")
         print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 4, 'status': 'done'})}")
-        print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'running'})}")
-        searcher = ctx.searcher if ctx else SearchTool()
-        queries = llm.generate_search_queries(
-            query_to_use, tool="ripgrep",
-            project_context=project_context,
-            file_structure=project_structure,
-        )
-        if expansion_keywords:
-            queries = expansion_keywords[:3] + queries
-        keyword_chunks: List[Dict] = []
-        for q in queries[:5]:
-            keyword_chunks.extend(searcher.search_and_chunk(q, search_path))
 
-        # Merge targeted + keyword results
-        top_chunks = list(targeted_chunks)
-        seen_files = {c["file"] for c in targeted_chunks}
-        for chunk in keyword_chunks:
-            if chunk["file"] not in seen_files:
-                top_chunks.append(chunk)
-                seen_files.add(chunk["file"])
+        # ── Step 5: Deep search (only if still insufficient) ──────────
+        if len(light_chunks) < 8:
+            print(f"[Step 5/6] Deep search ({len(light_chunks)} chunks < 8)...")
+            print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'running'})}")
 
-        if len(top_chunks) >= 3:
-            print(f"   [Smart-Route] Sufficient context ({len(top_chunks)} chunks). Skipping full embedding index.")
-            if len(top_chunks) > 5:
-                reranker = ctx.reranker if ctx else CrossEncoderReranker()
-                top_chunks = (
-                    list(targeted_chunks)
-                    + reranker.rerank(query_to_use, keyword_chunks, top_k=max(5 - len(targeted_chunks), 2))
-                )
-        else:
-            print(f"   [Fallback] Only {len(top_chunks)} chunks found. Running full search index...")
-            vector_tool = ctx.vector_tool if ctx else VectorSearchTool(
-                embedding_client=EmbeddingClient(), cache_dir=os.path.join(".cache", "vector_index")
+            _searcher = ctx.searcher if ctx else SearchTool()
+            queries = llm.generate_search_queries(
+                query_to_use, tool="ripgrep",
+                project_context=project_context,
+                file_structure=project_structure,
             )
-            vector_tool.build_index(search_path, force_rebuild=rebuild_index)
-            vector_results = vector_tool.search(query_to_use, top_k=20)
+            if expansion_keywords:
+                queries = expansion_keywords[:3] + queries
+            keyword_chunks: List[Dict] = []
+            for q in queries[:5]:
+                results = _searcher.search_and_chunk(q, search_path)
+                keyword_chunks.extend(results[:20])
 
-            bm25_tool = ctx.bm25_tool if ctx else BM25SearchTool(cache_dir=os.path.join(".cache", "bm25_index"))
-            bm25_tool.build_index(vector_tool.metadata, force_rebuild=rebuild_index)
-            bm25_results = bm25_tool.search(query_to_use, top_k=20)
-
-            candidates = reciprocal_rank_fusion(
-                [vector_results, bm25_results, keyword_chunks]
-            )
-            reranker = ctx.reranker if ctx else CrossEncoderReranker()
-            search_chunks = reranker.rerank(query_to_use, candidates, top_k=5)
-
-            for chunk in search_chunks:
+            deduped_keyword: List[Dict] = []
+            for chunk in keyword_chunks:
                 if chunk["file"] not in seen_files:
-                    top_chunks.append(chunk)
+                    deduped_keyword.append(chunk)
                     seen_files.add(chunk["file"])
+
+            all_found = list(light_chunks) + deduped_keyword
+            if len(all_found) >= 3:
+                if len(deduped_keyword) > 5:
+                    reranker = ctx.reranker if ctx else CrossEncoderReranker()
+                    deduped_keyword = reranker.rerank(
+                        query_to_use, deduped_keyword,
+                        top_k=max(8 - len(light_chunks), 3),
+                    )
+                top_chunks = list(light_chunks) + deduped_keyword
+            else:
+                print(f"   [Fallback] Only {len(all_found)} chunks. Running full search index...")
+                vector_tool = ctx.vector_tool if ctx else VectorSearchTool(
+                    embedding_client=EmbeddingClient(), cache_dir=os.path.join(".cache", "vector_index")
+                )
+                vector_tool.build_index(search_path, force_rebuild=rebuild_index)
+                vector_results = vector_tool.search(query_to_use, top_k=20)
+
+                bm25_tool = ctx.bm25_tool if ctx else BM25SearchTool(cache_dir=os.path.join(".cache", "bm25_index"))
+                bm25_tool.build_index(vector_tool.metadata, force_rebuild=rebuild_index)
+                bm25_results = bm25_tool.search(query_to_use, top_k=20)
+
+                candidates = reciprocal_rank_fusion(
+                    [vector_results, bm25_results, keyword_chunks]
+                )
+                reranker = ctx.reranker if ctx else CrossEncoderReranker()
+                search_chunks = reranker.rerank(query_to_use, candidates, top_k=5)
+
+                top_chunks = list(light_chunks)
+                top_seen = {c["file"] for c in top_chunks}
+                for chunk in search_chunks:
+                    if chunk["file"] not in top_seen:
+                        top_chunks.append(chunk)
+                        top_seen.add(chunk["file"])
+
+            print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'done'})}")
+        else:
+            print(f"   [Quick+Targeted] Sufficient context ({len(light_chunks)} chunks). Skipping deep search.")
+            top_chunks = light_chunks
+            print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 5, 'status': 'done'})}")
 
         print(f"   Final context: {len(top_chunks)} chunks")
 

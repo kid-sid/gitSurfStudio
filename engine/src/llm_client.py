@@ -135,7 +135,6 @@ class LLMClient:
             data = _extract_json_object(content)
             if data:
                 data.setdefault("is_action_request", False)
-                data.setdefault("is_overview_question", False)
                 data.setdefault("target_files", [])
                 data.setdefault("action_type", None)
                 data.setdefault("direct_tool_call", None)
@@ -148,7 +147,6 @@ class LLMClient:
             "refined_question": user_question,
             "keywords": [],
             "is_action_request": False,
-            "is_overview_question": False,
         }
 
     def identify_relevant_files(

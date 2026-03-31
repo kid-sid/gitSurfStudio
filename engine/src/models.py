@@ -183,6 +183,12 @@ class LintRequest(BaseModel):
         return v
 
 
+class FixLintRequest(BaseModel):
+    file_path: str
+    content: str
+    diagnostics: list = []
+
+
 class SessionRequest(BaseModel):
     user_id: str
     repo_identifier: str
