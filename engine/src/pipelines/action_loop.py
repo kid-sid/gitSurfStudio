@@ -34,13 +34,30 @@ def execute_action_loop(
     _exact_calls: Dict[str, int] = {}
     _method_calls: Dict[str, int] = {}
     _file_writes: Dict[str, int] = {}  # track per-file write counts
+    _completed_files: Dict[str, str] = {}  # path → "created" | "modified"
 
     for iteration in range(1, max_iterations + 1):
         print(f"   [Iteration {iteration}/{max_iterations}] Thinking...")
         print(f"[UI_COMMAND] agent_step {json.dumps({'step_id': 100 + iteration, 'status': 'running', 'description': f'Iteration {iteration}: Reasoning...'})}")
 
+        # ── Build dynamic task-progress prefix ────────────────────────
+        if len(_completed_files) > 0:
+            _done_lines = "\n".join(
+                f"  ✓ {path} ({action})" for path, action in _completed_files.items()
+            )
+            _progress_block = (
+                f"=== TASK PROGRESS (iteration {iteration}/{max_iterations}) ===\n"
+                f"ALREADY DONE — do NOT touch these files again:\n"
+                f"{_done_lines}\n"
+                f"Your next action MUST operate on a DIFFERENT file.\n"
+                f"{'=' * 52}"
+            )
+            _effective_prefix = f"{_progress_block}\n\n{extra_context_prefix}" if extra_context_prefix else _progress_block
+        else:
+            _effective_prefix = extra_context_prefix
+
         context_for_llm = build_context_for_llm(
-            initial_context, action_logs, extra_prefix=extra_context_prefix
+            initial_context, action_logs, extra_prefix=_effective_prefix
         )
 
         # Reason: LLM decides next action via CoT
@@ -158,12 +175,30 @@ def execute_action_loop(
             if method == "write_file":
                 _write_path = kwargs.get("rel_path", kwargs.get("path", ""))
                 _file_writes[_write_path] = _file_writes.get(_write_path, 0) + 1
-                if _file_writes[_write_path] > 2:
+                if _file_writes[_write_path] >= 2:
                     print(f"   [LoopGuard] File rewrite block — {_write_path} written {_file_writes[_write_path]}x")
+                    if _file_writes[_write_path] >= 4:
+                        # Hard break: LLM ignored 2 soft blocks, force completion
+                        print(f"   [LoopGuard] Hard file-rewrite block — forcing final_answer")
+                        _hard_obs = (
+                            f"[LoopGuard] HARD BLOCK — '{_write_path}' has been attempted "
+                            f"{_file_writes[_write_path]} times. That file is complete. "
+                            f"Forcing final answer with available context."
+                        )
+                        action_logs.append(
+                            f"\n\n--- ACTION LOG ---\n"
+                            f"Action taken: {tool_name}.{method}({kwargs})\nObservation: {_hard_obs}"
+                        )
+                        context_for_llm = build_context_for_llm(
+                            initial_context, action_logs, extra_prefix=extra_context_prefix
+                        )
+                        answer = llm.stream_final_answer(question, context_for_llm, history=history)
+                        break
                     observation = (
-                        f"[LoopGuard] BLOCKED — you already wrote '{_write_path}' {_file_writes[_write_path] - 1} time(s). "
-                        f"The file is done. Move on to the NEXT file in your plan, or use "
-                        f"replace_in_file() for targeted edits, or provide your final_answer."
+                        f"[LoopGuard] BLOCKED — '{_write_path}' was already written successfully. "
+                        f"That file is DONE — do NOT rewrite it. "
+                        f"Your next action MUST target a different file. "
+                        f"Use replace_in_file() if you need small fixes to an existing file."
                     )
                     action_str = f"Action taken: {tool_name}.{method}({kwargs})\nObservation: {observation}"
                     action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}")
@@ -190,6 +225,14 @@ def execute_action_loop(
             # Emit structured tool result event (done/error)
             _result_status = "error" if str(observation).startswith("[Error]") else "done"
             print(f"[UI_COMMAND] agent_action {json.dumps({'iteration': iteration, 'total': max_iterations, 'action': 'tool_call', 'tool': tool_name, 'method': method, 'status': _result_status, 'observation': obs_preview})}")
+
+            # ── Track completed files ──────────────────────────────────
+            if _result_status == "done":
+                _edit_path = kwargs.get("rel_path", kwargs.get("path", ""))
+                if method == "write_file" and _edit_path:
+                    _completed_files.update({_edit_path: "created"})
+                elif method in ("replace_in_file", "delete_file") and _edit_path:
+                    _completed_files.update({_edit_path: "modified"})
 
             # ── Auto-chain: resolve-library-id → query-docs ─────────────
             if "resolve" in _norm_name and "library" in _norm_name:
