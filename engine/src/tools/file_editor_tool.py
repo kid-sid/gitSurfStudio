@@ -17,12 +17,12 @@ class FileEditorTool:
             raise ValueError(f"Path restricted: {rel_path} resolves outside of root directory.")
         return abs_path
 
-    def read_file(self, rel_path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+    def read_file(self, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
         """Reads a file, optionally by line range (1-indexed)."""
         try:
-            abs_path = self._get_abs_path(rel_path)
+            abs_path = self._get_abs_path(path)
             if not os.path.exists(abs_path):
-                return f"[Error] File not found: {rel_path}"
+                return f"[Error] File not found: {path}"
             
             with open(abs_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
@@ -36,43 +36,37 @@ class FileEditorTool:
         except Exception as e:
             return f"[Error] Expected to read file: {e}"
 
-    def write_file(self, rel_path: str, content: str) -> str:
-        """Overwrites or creates a file. Creates a backup if the file already exists."""
+    def write_file(self, path: str, content: str) -> str:
+        """
+        Creates a NEW file. To prevent accidental data loss, this method
+        FAILS if the file already exists. To modify an existing file,
+        you MUST use replace_in_file().
+        """
         try:
-            abs_path = self._get_abs_path(rel_path)
+            abs_path = self._get_abs_path(path)
+            if os.path.exists(abs_path):
+                return f"[Error] File already exists: {path}. Use replace_in_file() for modifications."
+
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-
-            is_new_file = not os.path.exists(abs_path)
-
-            # Backup existing file before overwriting (only for existing files)
-            if not is_new_file:
-                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-                    existing = f.read()
-                backup_result = self._write_backup(abs_path, existing)
-                if backup_result:
-                    print(f"   [FileEditor] Backup created: {backup_result}")
-
+            
             # Signal UI that AI is about to write this file
             print(f"[UI_COMMAND] ai_writing_start {abs_path}")
 
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
-            # Signal UI: new files use file_created so the editor shows Keep/Delete
-            if is_new_file:
-                print(f"[UI_COMMAND] file_created {abs_path}")
-            else:
-                print(f"[UI_COMMAND] file_changed {abs_path}")
+            # Signal UI
+            print(f"[UI_COMMAND] file_created {abs_path}")
 
             line_count = len(content.splitlines())
-            return f"[Success] Wrote {rel_path} ({line_count} lines)."
+            return f"[Success] Wrote {path} ({line_count} lines)."
 
         except Exception as e:
             return f"[Error] Failed to write file: {e}"
 
     def replace_in_file(
         self,
-        rel_path: str,
+        path: str,
         target: str,
         replacement: str,
         allow_multiple: bool = False,
@@ -84,19 +78,30 @@ class FileEditorTool:
         Set allow_multiple=True only for intentional global find-and-replace.
         """ 
         try:
-            abs_path = self._get_abs_path(rel_path)
+            abs_path = self._get_abs_path(path)
             if not os.path.exists(abs_path):
-                return f"[Error] File not found: {rel_path}"
+                return f"[Error] File not found: {path}"
 
             with open(abs_path, "r", encoding="utf-8") as f:
                 original_content = f.read()
+
+            # Guard against accidental full-file replacement that wipes content
+            # (e.g., when the agent passes the entire file as the target and a
+            # small replacement snippet). Require the agent to use a smaller,
+            # specific target in that case to avoid clobbering the whole file.
+            if target.strip() == original_content.strip():
+                return (
+                    "[Error] Replacement would overwrite the entire file. "
+                    "Provide a smaller, unique target segment to replace so the rest "
+                    "of the file is preserved."
+                )
 
             # ── Occurrence check ─────────────────────────────────────────
             count = original_content.count(target)
 
             if count == 0:
                 return (
-                    f"[Error] Target string not found in {rel_path}. "
+                    f"[Error] Target string not found in {path}. "
                     f"The file may have changed since it was read. "
                     f"Use read_file() to get the current content before retrying."
                 )
@@ -115,7 +120,7 @@ class FileEditorTool:
                     match_preview += f"\n  ... and {count - 5} more"
 
                 return (
-                    f"[Error] Target string appears {count} times in {rel_path}. "
+                    f"[Error] Target string appears {count} times in {path}. "
                     f"Provide a more specific target that matches exactly once.\n"
                     f"Matches found at:\n{match_preview}"
                 )
@@ -135,7 +140,7 @@ class FileEditorTool:
                 len(new_content.splitlines()) - len(original_content.splitlines())
             )
             return (
-                f"[Success] Replaced content in {rel_path}. "
+                f"[Success] Replaced content in {path}. "
                 f"Lines delta: {lines_changed:+d}. "
                 f"Backup saved to {backup_result}."
             )
@@ -205,15 +210,15 @@ class FileEditorTool:
             print(f"   [FileEditor] Warning: Could not create backup: {e}")
             return None
 
-    def delete_file(self, rel_path: str) -> str:
+    def delete_file(self, path: str) -> str:
         """Deletes a file from the file system."""
         try:
-            abs_path = self._get_abs_path(rel_path)
+            abs_path = self._get_abs_path(path)
             if not os.path.exists(abs_path):
-                return f"[Error] File not found: {rel_path}"
+                return f"[Error] File not found: {path}"
                 
             os.remove(abs_path)
-            return f"[Success] Deleted file: {rel_path}"
+            return f"[Success] Deleted file: {path}"
         except Exception as e:
             return f"[Error] Failed to delete file: {e}"
 

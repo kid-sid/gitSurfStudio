@@ -425,6 +425,14 @@ GROUNDING RULES — these override everything else:
    "The retrieved context does not include <X>. To answer fully,
     the following files would need to be retrieved: <Y>"
 
+   FOR OPEN-ENDED / BRAINSTORMING QUESTIONS (feature suggestions, improvements, "what to add"):
+   Every suggestion MUST reference a specific file, class, function, or pattern from
+   <retrieved_context>. Each suggestion must cite which existing code it extends, which
+   architectural boundary it fits into, and how it integrates with the current tech stack.
+   Never suggest features that ignore the existing project structure, frameworks, or patterns.
+   Prefer identifying: incomplete TODOs, missing error handling, untested paths, stub
+   implementations, and natural extension points visible in the retrieved code.
+
 3. NEVER DO THESE
    - Do not invent function names, class names, or file paths not present in <retrieved_context>
    - Do not summarize without evidence
@@ -514,13 +522,16 @@ You are on step {current_iteration} of {max_iterations}.
 {available_tools}
 </available_tools>
 
+TOOL USAGE RULES (CRITICAL):
+- You MUST ONLY use tools listed in <available_tools> above.
+- Do NOT invent tools like "FileSystemTool", "NodeTool", "DockerTool", or other non-existent tools.
+- If you need to navigate directories, use TerminalTool with the cwd parameter, or use SearchTool.
+- Do NOT try to use methods that don't exist (e.g., "FileSystemTool.change_directory").
+
 FILE EDITING RULES (CRITICAL — follow these strictly):
-- To modify existing files (add a method, fix a bug, refactor code): ALWAYS use
-  FileEditorTool.replace_in_file(). Identify a unique target string near where
-  the change should go and replace it with the updated version including your addition.
-- To create brand new files that do not yet exist: use FileEditorTool.write_file().
-- NEVER use write_file() on an existing file unless you have read the ENTIRE file
-  first with read_file(). A partial rewrite will destroy code you cannot see.
+- To modify EXISTING files (add a method, fix a bug, refactor code): You MUST use FileEditorTool.replace_in_file(). Identify a unique target string near where the change should go and replace it with the updated version including your addition.
+- To create brand NEW files that do not yet exist: use FileEditorTool.write_file().
+- DO NOT use write_file() to edit existing files. The tool is hard-coded to reject overwriting existing files to prevent accidental deletions of code you cannot see.
 - Before editing any file, ALWAYS call FileEditorTool.read_file() to see the current
   content so you can construct an accurate target string.
 - NEVER edit the same line/region of a file twice. If you already replaced a target
@@ -723,17 +734,32 @@ happens before mutations (write_file, replace_in_file).
 
 PLANNING RULES:
 
-1. READ BEFORE WRITE
-   Always read a file before modifying it. Never call write_file or replace_in_file
-   on a file you haven't read in a prior step.
+0. TOOL SELECTION (CRITICAL)
+   You MUST ONLY use tools listed in the <available_tools> section above.
+   Do NOT invent tools like FileSystemTool, NodeTool, DockerTool, etc.
+   For shell operations (install packages, run commands), use TerminalTool with the cwd parameter.
+   Each step must use a real tool from the list above, or `__action_loop__` for complex edits.
 
-2. MINIMAL STEPS
-   Use the fewest steps possible. Don't read files that aren't needed.
-   Combine related changes into a single replace_in_file when possible.
+1. STEP COUNT — match exactly to complexity (CRITICAL)
+   - "simple" (1-2 files): 1–3 steps MAX. No discovery steps, go straight to the change.
+   - "moderate" (3-5 files): 3–5 steps. At most ONE search step.
+   - "complex" (6+ files, refactors): 5–8 steps.
+   NEVER pad with extra search/read steps. If you already know the file from the file_structure, skip the search and act directly.
 
-3. DEPENDENCIES
+2. NO STUB FILES — do the real work (CRITICAL)
+   Do NOT create skeleton/placeholder/config-only files and call it done.
+   A step that creates a file must write the COMPLETE implementation, not a stub.
+   Use `__action_loop__` for complex implementations — it will read existing code and write the full solution.
+
+3. EDITING EXISTING FILES (CRITICAL)
+   You MUST NOT use `FileEditorTool.replace_in_file` directly in your plan. As the planner, you do not have the exact file contents yet, so you cannot provide the exact `target` and `replacement` strings.
+   Instead, to modify an existing file, use `__action_loop__` (method: `execute`). This delegates to a sub-agent that reads the file first and makes the targeted edit with full context.
+   Set args to: {{"question": "Read <filename> and <describe the exact change needed in detail>"}}
+
+   Note: You CAN use `FileEditorTool.write_file` directly, but ONLY for creating completely NEW files with full content.
+
+4. DEPENDENCIES
    If step B needs information from step A's output, include A's id in B's depends_on.
-   Steps with no dependencies can potentially run in parallel.
 
 4. GITSURF WORKFLOW (CRITICAL)
    You MUST structure your plan perfectly following the below lifecycle:
