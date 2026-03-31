@@ -12,7 +12,7 @@ from src.llm_client import LLMClient
 from src.history_manager import HistoryManager
 from src.memory.supabase_memory import SupabaseMemory
 from src.memory.chat_memory import ChatMemory
-from src.tools.repo_manager import RepoManager
+from src.tools.repo_manager import CacheManager, RepoManager
 from src.tools.git_tool import GitTool
 from src.tools.symbol_extractor import SymbolExtractor
 from src.tools.symbol_peeker import SymbolPeeker
@@ -35,6 +35,9 @@ class EngineState:
         self.git_tool: Optional[GitTool] = None
         self.github_token: Optional[str] = None
         self.repo_manager = RepoManager(
+            cache_dir=os.path.join(_ENGINE_DIR, ".cache")
+        )
+        self.cache_manager = CacheManager(
             cache_dir=os.path.join(_ENGINE_DIR, ".cache")
         )
         self.symbol_extractor = SymbolExtractor(

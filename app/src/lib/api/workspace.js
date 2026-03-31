@@ -166,3 +166,34 @@ export async function deleteFile(path) {
   }
   return await response.json();
 }
+
+/**
+ * Returns cache status: total size, repo list, index sizes
+ */
+export async function getCacheStatus() {
+  const response = await fetch(`${ENGINE_URL}/cache/status`);
+  if (!response.ok) throw new Error("Failed to fetch cache status");
+  return await response.json();
+}
+
+/**
+ * Evicts old repos beyond LRU limit and deletes stale search indexes
+ */
+export async function cleanupCache() {
+  const response = await fetch(`${ENGINE_URL}/cache/cleanup`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error("Failed to cleanup cache");
+  return await response.json();
+}
+
+/**
+ * Purges all cached data except the active workspace
+ */
+export async function purgeCache() {
+  const response = await fetch(`${ENGINE_URL}/cache`, {
+    method: "DELETE",
+  });
+  if (!response.ok) throw new Error("Failed to purge cache");
+  return await response.json();
+}

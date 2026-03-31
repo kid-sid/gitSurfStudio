@@ -35,6 +35,7 @@ from src.engine_state import state
 from src.routes import limiter
 from src.routes.agent import router as agent_router
 from src.routes.auth import router as auth_router
+from src.routes.cache import router as cache_router
 from src.routes.chat import router as chat_router
 from src.routes.git import router as git_router
 from src.routes.health import router as health_router
@@ -79,12 +80,17 @@ app.include_router(agent_router)
 app.include_router(terminal_router)
 app.include_router(watcher_router)
 app.include_router(preview_router)
+app.include_router(cache_router)
 
 
 @app.on_event("shutdown")
-async def _shutdown_mcp():
+async def _shutdown():
     if state.mcp_manager:
         state.mcp_manager.shutdown()
+    # Clean stale search indexes on shutdown (repos preserved for fast restart)
+    import contextlib
+    with contextlib.suppress(Exception):
+        state.cache_manager.cleanup_search_indexes()
 
 
 # ── Entry Point ──────────────────────────────────────────────────────────

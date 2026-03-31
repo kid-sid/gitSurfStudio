@@ -17,6 +17,9 @@ export {
   restoreFile,
   cleanupBackup,
   deleteFile,
+  getCacheStatus,
+  cleanupCache,
+  purgeCache,
 } from "./workspace.js";
 export {
   sendChat,

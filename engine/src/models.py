@@ -253,3 +253,16 @@ class SymbolResponse(BaseModel):
 
 class AutocompleteResponse(BaseModel):
     completion: str
+
+
+class CacheStatusResponse(BaseModel):
+    total_size_mb: float
+    repo_count: int
+    repos: List[Dict]
+    indexes: Dict[str, float]
+
+
+class CacheCleanupResponse(BaseModel):
+    status: str
+    repos_removed: int
+    space_freed_mb: float

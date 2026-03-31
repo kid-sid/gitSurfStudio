@@ -13,7 +13,7 @@
   import CommandPalette from "./components/CommandPalette.svelte";
   import PreviewPanel from "./components/PreviewPanel.svelte";
   import { supabase, saveWorkspace, getRecentWorkspaces, deleteWorkspace } from "./lib/supabase.js";
-  import { initWorkspace, checkHealth } from "./lib/api.js";
+  import { initWorkspace, checkHealth, cleanupCache } from "./lib/api.js";
   import { startWatcher, stopWatcher } from "./lib/fileWatcher.js";
 
   const ENGINE_URL = (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1")
@@ -245,6 +245,8 @@
 
   function goHome() {
     stopWatcher();
+    // Fire-and-forget: evict old repos + delete stale search indexes
+    cleanupCache().catch(() => {});
     workspacePath = "";
     activeFile = "";
     openFiles = [];

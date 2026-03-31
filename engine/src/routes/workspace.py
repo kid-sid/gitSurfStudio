@@ -39,6 +39,13 @@ async def init_workspace(request: Request, req: InitRequest):
             target_path = state.repo_manager.sync_repo(repo_name)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to clone: {e}")
+
+        # Evict old cached repos beyond the LRU limit
+        try:
+            safe_name = repo_name.replace("/", "_").replace("\\", "_")
+            state.cache_manager.evict_old_repos(exclude=safe_name)
+        except Exception:
+            logger.warning("[CacheManager] Eviction failed (non-blocking)", exc_info=True)
     else:
         target_path = os.path.abspath(target_path)
         if not os.path.exists(target_path):
