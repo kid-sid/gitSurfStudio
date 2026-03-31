@@ -1,7 +1,9 @@
 <script>
   import { onMount, onDestroy } from "svelte";
-  import { readFile, writeFile, restoreFile, cleanupBackup, deleteFile, getCompletion, peekSymbol, getGitDiffLines, lintCode } from "../lib/api.js";
+  import { readFile, writeFile, restoreFile, cleanupBackup, deleteFile, getCompletion, peekSymbol, getGitDiffLines, lintCode, fixLint } from "../lib/api.js";
   import * as monaco from "monaco-editor";
+  import EditorTabBar from "./EditorTabBar.svelte";
+  import DiffOverlay from "./DiffOverlay.svelte";
 
   let { activeFile = $bindable(""), openFiles = $bindable([]), workspacePath = "" } = $props();
 
@@ -19,6 +21,7 @@
   let writingDecorations = null;      // IDecorationsCollection for "AI writing" glow
   let gitGutterDecorations = null;    // IDecorationsCollection for git diff gutter bars
   let completionProviderDisposable = null;
+  let codeActionProviderDisposable = null;
   let lintTimeout = null;
 
   // ── Language map ────────────────────────────────────────────────────────────
@@ -262,6 +265,54 @@
       freeInlineCompletions: () => {},
     });
 
+    // ── Feature 5: "Fix with AI" code action ────────────────────────────────
+    codeActionProviderDisposable = monaco.languages.registerCodeActionProvider("*", {
+      provideCodeActions(model, range, context) {
+        const markers = context.markers.filter(m => m.source === "gitsurf-lint");
+        if (markers.length === 0) return { actions: [], dispose() {} };
+
+        const action = {
+          title: "⚡ Fix with AI",
+          kind: "quickfix",
+          diagnostics: markers,
+          isPreferred: true,
+        };
+        action.command = {
+          id: "gitsurf.fixLintAI",
+          title: "Fix with AI",
+          arguments: [model.uri.toString(), markers],
+        };
+        return { actions: [action], dispose() {} };
+      },
+    });
+
+    editor.addCommand(0, async (_accessor, uri, markers) => {
+      const path = activeFile;
+      if (!path || !models[path]) return;
+
+      const content = models[path].getValue();
+      const diagnostics = markers.map(m => ({
+        line: m.startLineNumber,
+        column: m.startColumn,
+        message: m.message,
+        severity: m.severity === monaco.MarkerSeverity.Error ? "error" : "warning",
+        source: m.source || "lint",
+        code: "",
+      }));
+
+      try {
+        const { fixed_content } = await fixLint(path, content, diagnostics);
+        if (fixed_content && fixed_content !== content) {
+          models[path].pushEditOperations([], [{
+            range: models[path].getFullModelRange(),
+            text: fixed_content,
+          }], () => null);
+        }
+      } catch (e) {
+        console.error("Fix with AI failed:", e.message);
+      }
+    }, "gitsurf.fixLintAI");
+
     // ── Feature 3: AI writing decoration ─────────────────────────────────────
     const handleWritingStart = (e) => {
       const { path } = e.detail;
@@ -458,6 +509,7 @@
   onDestroy(() => {
     clearTimeout(lintTimeout);
     completionProviderDisposable?.dispose();
+    codeActionProviderDisposable?.dispose();
     Object.values(models).forEach(m => m.dispose());
     editor?.dispose();
   });
@@ -676,8 +728,7 @@
   }
 
   // ── Close tab ────────────────────────────────────────────────────────────────
-  function handleCloseTab(path, e) {
-    e.stopPropagation();
+  function handleCloseTab(path) {
     const index = openFiles.indexOf(path);
     if (index === -1) return;
 
@@ -700,88 +751,21 @@
 </script>
 
 <div class="editor">
-  <!-- Tab bar -->
-  <div class="editor__tab-bar">
-    <div class="editor__tabs">
-      {#if openFiles.length > 0}
-        {#each openFiles as path}
-          {@const f = filesState[path] || {}}
-          <button
-            class="editor__tab"
-            class:editor__tab--active={activeFile === path}
-            class:editor__tab--diff={pendingDiff?.path === path}
-            onclick={() => activeFile = path}
-          >
-            <span>{path.split(/[/\\]/).pop()}</span>
-            {#if f.isDirty}
-              <span class="editor__modified-dot"></span>
-            {/if}
-            <span
-              class="editor__tab-close"
-              onclick={(e) => handleCloseTab(path, e)}
-              onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { handleCloseTab(path, e); } }}
-              role="button"
-              tabindex="0"
-              title="Close tab"
-              aria-label="Close tab"
-            >
-              ×
-            </span>
-          </button>
-        {/each}
-      {:else}
-        <div class="editor__tab editor__tab--active"><span>Welcome</span></div>
-      {/if}
-    </div>
+  <EditorTabBar
+    {openFiles}
+    bind:activeFile
+    {filesState}
+    {pendingDiff}
+    onclose={handleCloseTab}
+    onsave={handleSave}
+  />
 
-    <div class="editor__actions">
-      {#if activeFile && filesState[activeFile]}
-        {@const f = filesState[activeFile]}
-        {#if f.saveStatus === "success"}
-          <span class="save-toast success">Saved!</span>
-        {:else if f.saveStatus === "error"}
-          <span class="save-toast error">Failed to save</span>
-        {/if}
-        <button
-          class="save-button"
-          onclick={() => handleSave(activeFile)}
-          disabled={!f.isDirty || f.isSaving}
-          title="Save (Ctrl+S)"
-        >
-          {f.isSaving ? "Saving..." : "Save"}
-        </button>
-      {/if}
-    </div>
-  </div>
-
-  <!-- AI Diff bar (Features 1 & 2) -->
-  {#if pendingDiff && pendingDiff.path === activeFile}
-    {@const s = pendingDiff.stats}
-    {@const isNew = pendingDiff.isNewFile}
-    <div class="editor__diff-bar">
-      <span class="editor__diff-icon">{isNew ? "✨" : "⚡"}</span>
-      <span class="editor__diff-label">{isNew ? "AI created this file" : "AI edited this file"}</span>
-      <div class="editor__diff-stats">
-        {#if s.added > 0}
-          <span class="stat stat--added">+{s.added}</span>
-        {/if}
-        {#if s.changed > 0}
-          <span class="stat stat--changed">~{s.changed}</span>
-        {/if}
-        {#if s.deleted > 0}
-          <span class="stat stat--deleted">-{s.deleted}</span>
-        {/if}
-      </div>
-      <div class="editor__diff-actions">
-        <button class="diff-btn diff-btn--accept" onclick={acceptDiff} title={isNew ? "Keep this file" : "Keep AI changes"}>
-          ✓ {isNew ? "Keep" : "Accept"}
-        </button>
-        <button class="diff-btn diff-btn--reject" onclick={rejectDiff} title={isNew ? "Delete this file" : "Restore original"}>
-          ✗ {isNew ? "Delete" : "Reject"}
-        </button>
-      </div>
-    </div>
-  {/if}
+  <DiffOverlay
+    {pendingDiff}
+    {activeFile}
+    onaccept={acceptDiff}
+    onreject={rejectDiff}
+  />
 
   <!-- Editor body -->
   <div class="editor__body">
@@ -821,105 +805,6 @@
     background: var(--bg-primary);
     color: var(--text-primary);
   }
-
-  /* ── Tab bar ── */
-  .editor__tab-bar {
-    display: flex;
-    align-items: stretch;
-    height: 36px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-    user-select: none;
-    overflow: hidden;
-    flex-shrink: 0;
-  }
-  .editor__tabs {
-    display: flex; align-items: stretch; flex: 1;
-    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
-  }
-  .editor__tabs::-webkit-scrollbar { display: none; }
-  .editor__tab {
-    display: flex; align-items: center; gap: 6px; padding: 0 12px;
-    font-size: 12px; color: var(--text-secondary);
-    border-bottom: 2px solid transparent; border-right: 1px solid var(--border);
-    cursor: pointer; background: transparent; white-space: nowrap;
-    flex-shrink: 0; transition: background 0.15s, color 0.15s;
-  }
-  .editor__tab--active {
-    color: var(--text-primary);
-    border-bottom-color: var(--accent-blue);
-    background: var(--bg-primary);
-  }
-  .editor__tab--diff {
-    border-bottom-color: #3fb950 !important;
-  }
-  .editor__modified-dot {
-    width: 6px; height: 6px; border-radius: 50%;
-    background: var(--accent-blue); flex-shrink: 0;
-  }
-  .editor__tab-close {
-    background: none; border: none; color: inherit; font-size: 16px;
-    padding: 2px; cursor: pointer; opacity: 0.5; line-height: 1;
-  }
-  .editor__tab-close:hover { opacity: 1; color: var(--accent-red); }
-
-  .editor__actions {
-    display: flex; align-items: center; gap: 8px; padding: 0 10px;
-    flex-shrink: 0; border-left: 1px solid var(--border);
-  }
-  .save-toast { font-size: 11px; font-weight: 500; animation: fadeIn 0.2s ease; }
-  .save-toast.success { color: var(--accent-green); }
-  .save-toast.error   { color: var(--accent-red); }
-  @keyframes fadeIn {
-    from { opacity: 0; transform: translateX(5px); }
-    to   { opacity: 1; transform: translateX(0); }
-  }
-  .save-button {
-    background: var(--accent-blue); color: white; border: none;
-    padding: 4px 12px; border-radius: 4px; font-size: 11px;
-    font-weight: 600; cursor: pointer; transition: opacity 0.2s;
-  }
-  .save-button:hover:not(:disabled) { filter: brightness(1.1); }
-  .save-button:disabled { opacity: 0.3; cursor: default; }
-
-  /* ── AI Diff bar (Features 1 & 2) ── */
-  .editor__diff-bar {
-    display: flex; align-items: center; gap: 10px;
-    padding: 5px 12px; flex-shrink: 0;
-    background: rgba(27, 67, 50, 0.5);
-    border-bottom: 1px solid rgba(63, 185, 80, 0.3);
-    animation: slideDown 0.2s ease;
-  }
-  @keyframes slideDown {
-    from { opacity: 0; transform: translateY(-4px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
-  .editor__diff-icon { font-size: 13px; }
-  .editor__diff-label { font-size: 12px; color: #3fb950; font-weight: 500; flex-shrink: 0; }
-  .editor__diff-stats { display: flex; gap: 6px; flex: 1; }
-  .stat {
-    font-size: 11px; font-weight: 600; font-family: var(--font-mono);
-    padding: 1px 5px; border-radius: 3px;
-  }
-  .stat--added   { color: #3fb950; background: rgba(63, 185, 80, 0.15); }
-  .stat--changed { color: #e3b341; background: rgba(227, 179, 65, 0.15); }
-  .stat--deleted { color: #f85149; background: rgba(248, 81, 73, 0.15); }
-  .editor__diff-actions { display: flex; gap: 6px; }
-  .diff-btn {
-    font-size: 11px; font-weight: 600; padding: 3px 10px;
-    border-radius: 4px; cursor: pointer; border: 1px solid;
-    transition: all 0.15s;
-  }
-  .diff-btn--accept {
-    color: #3fb950; border-color: rgba(63, 185, 80, 0.4);
-    background: rgba(63, 185, 80, 0.1);
-  }
-  .diff-btn--accept:hover { background: rgba(63, 185, 80, 0.25); }
-  .diff-btn--reject {
-    color: #f85149; border-color: rgba(248, 81, 73, 0.4);
-    background: rgba(248, 81, 73, 0.1);
-  }
-  .diff-btn--reject:hover { background: rgba(248, 81, 73, 0.25); }
 
   /* ── Editor body ── */
   .editor__body {

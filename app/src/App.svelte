@@ -10,8 +10,11 @@
   import SymbolBrowser from "./components/SymbolBrowser.svelte";
   import AuthPage from "./components/AuthPage.svelte";
   import TerminalPanel from "./components/TerminalPanel.svelte";
+  import CommandPalette from "./components/CommandPalette.svelte";
+  import PreviewPanel from "./components/PreviewPanel.svelte";
   import { supabase, saveWorkspace, getRecentWorkspaces, deleteWorkspace } from "./lib/supabase.js";
   import { initWorkspace, checkHealth } from "./lib/api.js";
+  import { startWatcher, stopWatcher } from "./lib/fileWatcher.js";
 
   const ENGINE_URL = (typeof window !== "undefined" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1")
     ? `${window.location.protocol}//${window.location.hostname}:8002`
@@ -28,9 +31,11 @@
   let isAuthenticated = $state(false);
   let activeSidebarView = $state("explorer"); // "explorer" or "git"
   let showTerminal = $state(false);
+  let showPreview = $state(false);
   let recentWorkspaces = $state([]);
   let mcpReady = $state(false);
   let mcpToolCount = $state(0);
+  let commandPaletteRef;
 
   // Ensure activeFile is always in openFiles
   $effect(() => {
@@ -61,12 +66,26 @@
       engineOnline = await checkHealth();
     }, 10000);
 
-    // Ctrl+` — toggle terminal panel
+    // Global keyboard shortcuts
     window.addEventListener("keydown", (e) => {
       if (e.ctrlKey && e.code === "Backquote") {
         e.preventDefault();
         showTerminal = !showTerminal;
       }
+      if (e.ctrlKey && e.key === "k") {
+        e.preventDefault();
+        commandPaletteRef?.open("files");
+      }
+      if (e.ctrlKey && e.shiftKey && e.key === "P") {
+        e.preventDefault();
+        commandPaletteRef?.open("commands");
+      }
+    });
+
+    // File watcher: refresh file tree on filesystem changes
+    window.addEventListener("fs-batch", () => {
+      // Trigger a file tree refresh by dispatching a custom event
+      window.dispatchEvent(new CustomEvent("refresh-file-tree"));
     });
 
     // Cross-file F12 navigation: open file then scroll to line
@@ -129,6 +148,9 @@
           } catch (_) {}
         }
       })();
+
+      // Start file watcher for auto-refresh
+      startWatcher(res.workspace_path);
     } catch (e) {
       initError = e.message;
     } finally {
@@ -180,7 +202,49 @@
     }
   }
 
+  function handlePaletteSelect(detail) {
+    if (detail.type === "file") {
+      handleFileSelect({ detail: { path: detail.path } });
+    } else if (detail.type === "symbol") {
+      handleFileSelect({ detail: { path: detail.path } });
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent("navigate-to-line", {
+          detail: { path: detail.path, line: detail.line }
+        }));
+      }, 150);
+    }
+  }
+
+  function handlePaletteCommand(id) {
+    switch (id) {
+      case "toggle-terminal":
+        showTerminal = !showTerminal;
+        break;
+      case "toggle-sidebar-explorer":
+        activeSidebarView = "explorer";
+        break;
+      case "toggle-sidebar-git":
+        activeSidebarView = "git";
+        break;
+      case "toggle-sidebar-symbols":
+        activeSidebarView = "symbols";
+        break;
+      case "ask-ai":
+        window.dispatchEvent(new CustomEvent("chat-prefill", {
+          detail: { query: "", autoSend: false }
+        }));
+        break;
+      case "toggle-preview":
+        showPreview = !showPreview;
+        break;
+      case "go-home":
+        goHome();
+        break;
+    }
+  }
+
   function goHome() {
+    stopWatcher();
     workspacePath = "";
     activeFile = "";
     openFiles = [];
@@ -218,6 +282,12 @@
           onclick={() => showTerminal = !showTerminal}
           title="Toggle Terminal (Ctrl+`)"
         >&gt;_</button>
+        <button
+          class="terminal-toggle-btn"
+          class:active={showPreview}
+          onclick={() => showPreview = !showPreview}
+          title="Toggle Live Preview"
+        >🌐</button>
       {/if}
       {#if workspacePath && isGitHubRepo}
         <ForkButton {workspacePath} isGitHub={isGitHubRepo} />
@@ -338,17 +408,34 @@
         {/if}
       </div>
 
+      {#if showPreview}
+        <aside class="preview-pane">
+          <PreviewPanel {workspacePath} bind:isOpen={showPreview} />
+        </aside>
+      {/if}
+
       <aside class="chat-panel">
-        <ChatPanel 
-          {workspacePath} 
-          bind:engineOnline 
-          oncommand={handleUICommand} 
+        <ChatPanel
+          {workspacePath}
+          bind:engineOnline
+          oncommand={handleUICommand}
         />
       </aside>
     </div>
   {/if}
 
   <StatusBar currentFile={activeFile} {engineOnline} {workspacePath} {mcpReady} {mcpToolCount} />
+
+  {#if workspacePath}
+    <CommandPalette
+      bind:this={commandPaletteRef}
+      {workspacePath}
+      {activeFile}
+      {openFiles}
+      onselect={handlePaletteSelect}
+      oncommand={handlePaletteCommand}
+    />
+  {/if}
 
   {/if} <!-- end auth gate -->
 </div>
@@ -521,6 +608,11 @@
   .sidebar { width: 260px; min-width: 200px; background: var(--bg-secondary); border-right: 1px solid var(--border); overflow-y: auto; }
   .editor-column { flex: 1; min-width: 200px; display: flex; flex-direction: column; overflow: hidden; }
   .editor-area { flex: 1; min-width: 0; overflow: hidden; background: var(--bg-primary); }
+  .preview-pane {
+    width: 420px; min-width: 300px; background: var(--bg-primary);
+    border-left: 1px solid var(--border); overflow: hidden;
+    display: flex; flex-direction: column;
+  }
   .chat-panel { width: 480px; min-width: 360px; background: var(--bg-secondary); border-left: 1px solid var(--border); overflow: hidden; display: flex; flex-direction: column; }
 
   /* Terminal panel */
