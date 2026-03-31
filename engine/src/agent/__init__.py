@@ -8,9 +8,9 @@ Components:
   - context_manager: Smart context budgeting for LLM calls
 """
 
-from src.agent.planner import AgentPlanner, AgentPlan, PlanStep
-from src.agent.executor import AgentExecutor, ExecutionResult
-from src.agent.changeset import Changeset, FileChange
+from .planner import AgentPlanner, AgentPlan, PlanStep
+from .executor import AgentExecutor, ExecutionResult
+from .changeset import Changeset, FileChange
 
 __all__ = [
     "AgentPlanner",

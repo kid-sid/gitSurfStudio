@@ -173,10 +173,10 @@ def reciprocal_rank_fusion(results_lists: List[List[Dict]], k: int = 60) -> List
     return merged
 
 # Maximum characters sent to the LLM in a single action loop iteration.
-# Keeps prompts within ~20k tokens (at ~4 chars/token) to avoid API limits.
-_MAX_CONTEXT_CHARS = 80_000
-# Reserve this many chars for the initial context even when truncating logs.
-_INITIAL_CONTEXT_RESERVE = 40_000
+# Modern LLMs (Claude/GPT-4o) handle 128k+ tokens; 350k chars is ~85k tokens.
+_MAX_CONTEXT_CHARS = 350_000
+# Reserve this many chars for the initial context (targeted files).
+_INITIAL_CONTEXT_RESERVE = 100_000
 
 
 def _build_context_for_llm(
@@ -190,7 +190,8 @@ def _build_context_for_llm(
     the budget is exceeded, printing a notice so the LLM knows steps were omitted.
     """
     prefix = f"{extra_prefix}\n\n" if extra_prefix else ""
-    base = prefix + initial_context[:_INITIAL_CONTEXT_RESERVE]
+    initial_context_str: str = initial_context
+    base = prefix + initial_context_str[:_INITIAL_CONTEXT_RESERVE]
     budget = _MAX_CONTEXT_CHARS - len(base)
 
     if budget <= 0:
@@ -199,10 +200,25 @@ def _build_context_for_llm(
     # Fit as many recent logs as possible within the remaining budget
     kept: List[str] = []
     for log in reversed(action_logs):
-        if len(log) > budget:
+        if len(log) <= budget:
+            kept.insert(0, log)
+            budget -= len(log)
+        elif budget > 2000: # If it doesn't fit, but we have space, truncate it
+            # Truncate to use the rest of the budget
+            log_str: str = log
+            truncated_log = log_str[:budget-500] + "... [Log Truncated]"
+            kept.insert(0, truncated_log)
+            budget = 0
             break
-        kept.insert(0, log)
-        budget -= len(log)
+        else:
+            break
+    
+    # Safety: if we have NO logs because the recent one was huge and we had no budget,
+    # force at least a partial view of the most recent observation.
+    if not kept and action_logs:
+        most_recent: str = action_logs[-1]
+        truncated = most_recent[:15000] + "... [Log Truncated]"
+        kept.append(truncated)
 
     dropped = len(action_logs) - len(kept)
     omission = f"\n\n[{dropped} earlier action(s) omitted to stay within context limit]\n" if dropped else ""
@@ -479,7 +495,10 @@ def execute_action_loop(
                         action_logs.append(f"\n\n--- ACTION LOG ---\n{action_str}{reflection}")
                         continue  # skip generic reflection
 
-            # Reflect: record this step as a log entry
+            # Update rel_path to path in iteration logs for consistency
+            if "rel_path" in kwargs:
+                kwargs["path"] = kwargs.pop("rel_path")
+            
             action_str = f"Action taken: {tool_name}.{method}({kwargs})\nObservation: {observation}"
             reflection = (
                 "\n--- REFLECT ---\n"
@@ -582,31 +601,34 @@ def run_code_aware_pipeline(
     call_graph_context = ""
     skeleton_context = ""
 
-    if is_action_request:
-        print("   [Fast-Path] Action command detected. Skipping search pipeline (Steps 3-7).")
-    else:
-        # Step 3: Skeleton Analysis
-        print("[Step 3/8] Skeleton Analysis (identifying relevant files)...")
-        targeted_files: List[str] = []
-        if project_structure:
-            targeted_files = llm.identify_relevant_files(
-                query_to_use, project_structure, symbol_minimap=symbol_minimap
-            )
-            if targeted_files:
-                skeleton_context = "Targeted files:\n" + "\n".join(
-                    f"  - {f}" for f in targeted_files
-                )
-
-        # Step 4: Targeted File Retrieval
-        print("[Step 4/8] Targeted File Retrieval...")
-        targeted_retriever = TargetedRetriever(cache_path=search_path)
-        targeted_chunks: List[Dict] = []
+    # Step 3: Skeleton Analysis
+    print("[Step 3/8] Skeleton Analysis (identifying relevant files)...")
+    targeted_files: List[str] = []
+    if project_structure:
+        targeted_files = llm.identify_relevant_files(
+            query_to_use, project_structure, symbol_minimap=symbol_minimap
+        )
         if targeted_files:
-            targeted_chunks = targeted_retriever.retrieve_files(targeted_files)
-            print(f"   Retrieved {len(targeted_chunks)} targeted file(s)")
-        else:
-            print("   No targeted files identified, relying on search only")
+            skeleton_context = "Targeted files:\n" + "\n".join(
+                f"  - {f}" for f in targeted_files
+            )
 
+    # Step 4: Targeted File Retrieval
+    print("[Step 4/8] Targeted File Retrieval...")
+    targeted_retriever = TargetedRetriever(cache_path=search_path)
+    targeted_chunks: List[Dict] = []
+    if targeted_files:
+        targeted_chunks = targeted_retriever.retrieve_files(targeted_files)
+        print(f"   Retrieved {len(targeted_chunks)} targeted file(s)")
+    else:
+        print("   No targeted files identified, relying on search only")
+
+    if is_action_request:
+        # Action requests: use skeleton + targeted files as context,
+        # skip heavy search/embedding steps — the agent loop has tools to read more.
+        top_chunks = list(targeted_chunks)
+        print(f"   [Action-Path] Using {len(top_chunks)} targeted chunks. Skipping search pipeline (Steps 5-7).")
+    else:
         # Step 5: Symbol Extraction + Call Graph
         print("[Step 5/8] Code Analysis (Symbols + Call Graph)...")
         sym_extractor = ctx.sym_extractor if ctx else SymbolExtractor(cache_dir=os.path.join(".cache", "symbols"))
@@ -701,7 +723,7 @@ def run_code_aware_pipeline(
 SKIP_DIRS_LOCAL = {
     'node_modules', '.git', '.cache', '__pycache__', 'venv', '.venv',
     'dist', 'build', 'target', 'bin', 'obj', 'vendor', '.idea', '.vscode',
-    '.next', '.nuxt', 'coverage', '.tox', 'eggs', '.eggs',
+    '.next', '.nuxt', 'coverage', '.tox', 'eggs', '.eggs', '.claude',
 }
 
 INDEXABLE_EXTENSIONS_LOCAL = {
@@ -715,7 +737,7 @@ INDEXABLE_EXTENSIONS_LOCAL = {
 def build_local_file_tree(root_path: str, max_files: int = 500) -> str:
     """Build a lightweight file tree string for skeleton analysis."""
     tree_lines = []
-    count = 0
+    count: int = 0
     root_path = os.path.abspath(root_path)
 
     for dirpath, dirnames, filenames in os.walk(root_path):
@@ -733,7 +755,7 @@ def build_local_file_tree(root_path: str, max_files: int = 500) -> str:
             rel_path = os.path.join(rel_dir, filename) if rel_dir else filename
             rel_path = rel_path.replace("\\", "/")
             tree_lines.append(rel_path)
-            count += 1
+            count = count + 1
             if count >= max_files:
                 tree_lines.append(f"... ({count}+ files, truncated)")
                 return "\n".join(tree_lines)
@@ -897,24 +919,27 @@ def run_local_pipeline(
 
     top_chunks: List[Dict] = []
 
-    if is_action_request:
-        print("   [Fast-Path] Action command detected. Skipping search pipeline.")
+    # Step 3: Skeleton Analysis (LLM identifies key files)
+    print("[Step 3/6] Skeleton Analysis (identifying relevant files)...")
+    targeted_files = llm.identify_relevant_files(
+        query_to_use, project_structure, symbol_minimap=None
+    )
+
+    # Step 4: Targeted Retrieval (read only those files)
+    print("[Step 4/6] Targeted File Retrieval...")
+    targeted_chunks: List[Dict] = []
+    if targeted_files:
+        targeted_chunks = retrieve_local_files(search_path, targeted_files)
+        print(f"   Retrieved {len(targeted_chunks)} targeted file(s)")
     else:
-        # Step 3: Skeleton Analysis (LLM identifies key files)
-        print("[Step 3/6] Skeleton Analysis (identifying relevant files)...")
-        targeted_files = llm.identify_relevant_files(
-            query_to_use, project_structure, symbol_minimap=None
-        )
+        print("   No targeted files identified")
 
-        # Step 4: Targeted Retrieval (read only those files)
-        print("[Step 4/6] Targeted File Retrieval...")
-        targeted_chunks: List[Dict] = []
-        if targeted_files:
-            targeted_chunks = retrieve_local_files(search_path, targeted_files)
-            print(f"   Retrieved {len(targeted_chunks)} targeted file(s)")
-        else:
-            print("   No targeted files identified")
-
+    if is_action_request:
+        # Action requests: use skeleton + targeted files as context,
+        # skip heavy keyword/embedding search — the agent loop has tools to read more.
+        top_chunks = list(targeted_chunks)
+        print(f"   [Action-Path] Using {len(top_chunks)} targeted chunks. Skipping keyword/embedding search.")
+    else:
         # Step 5: Ripgrep for keyword matches
         print("[Step 5/6] Keyword Search (Ripgrep)...")
         searcher = ctx.searcher if ctx else SearchTool()
@@ -972,7 +997,7 @@ def run_local_pipeline(
                     top_chunks.append(chunk)
                     seen_files.add(chunk["file"])
 
-        print(f"   Final context: {len(top_chunks)} chunks")
+    print(f"   Final context: {len(top_chunks)} chunks")
 
     # Step 6: Agentic Action Loop
     print("[Step 6/6] Agentic Action Loop (Synthesizing/Editing)...")
@@ -1003,6 +1028,9 @@ def run_agent_pipeline(
     history=None,
     ctx: Optional[PipelineContext] = None,
     terminal_tool=None,
+    state=None,
+    session_id: Optional[str] = None,
+    session_memory=None,
 ) -> tuple:
     """
     Agent-mode pipeline: Plan → Execute → Verify.
@@ -1053,12 +1081,29 @@ def run_agent_pipeline(
         workspace_path=search_path,
         terminal_tool=terminal_tool,
     )
+    # BUG FIX: assign to state so /agent/cancel and /agent/respond work
+    if state is not None:
+        state.active_executor = executor
+
+    # Step 3.5: Initialize session memory for in-session recovery
+    import uuid
+    task_id = None
+    if session_memory and session_id:
+        task_id = uuid.uuid4().hex[:12]
+        session_memory.start_task(session_id, task_id, plan.to_dict(), question)
+        # Store session context in state for /agent/respond endpoint
+        if state is not None:
+            state.active_session_id = session_id
+            state.active_task_id = task_id
 
     result = executor.execute(
         plan=plan,
         initial_context=initial_context,
         project_structure=project_structure,
         history=history,
+        session_memory=session_memory,
+        session_id=session_id,
+        task_id=task_id,
     )
 
     print(f"   [Agent] Status: {result.status} "
@@ -1068,5 +1113,9 @@ def run_agent_pipeline(
         print(f"   [Agent] Files changed: {len(result.changeset.changes)}")
         for change in result.changeset.changes:
             print(f"     {change.diff_summary}")
+
+    # Clear active executor after completion
+    if state is not None:
+        state.active_executor = None
 
     return result.answer, result.changeset.to_dict()

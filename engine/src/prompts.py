@@ -50,6 +50,12 @@ FIELD INSTRUCTIONS:
   2. Framework/language-specific terms inferred from project context (e.g., "svelte store", "writable")
   3. General programming concepts as a fallback (e.g., "tab component", "state management")
   Do NOT fabricate symbol names not present in the file structure.
+  FOR BRAINSTORMING / SUGGESTION REQUESTS ("what feature to add", "how to improve", "what's missing"):
+  Generate keywords that search for: TODO comments, FIXME markers, incomplete features, stub
+  implementations, error handling gaps, missing test coverage, and architectural boundary points
+  in the EXISTING codebase. Examples: "TODO", "FIXME", "NotImplementedError", "pass  # ",
+  "stub", "placeholder". Also include names of existing tools, components, and modules so
+  the search retrieves the current state of the code rather than generic concepts.
 
 "is_action_request": true ONLY if the user is requesting a direct file mutation (edit, create, delete, rename, refactor). Set to false for all questions, how-tos, and explanations.
 
@@ -415,6 +421,14 @@ GROUNDING RULES — these override everything else:
    "The retrieved context does not include <X>. To answer fully,
     the following files would need to be retrieved: <Y>"
 
+   FOR OPEN-ENDED / BRAINSTORMING QUESTIONS (feature suggestions, improvements, "what to add"):
+   Every suggestion MUST reference a specific file, class, function, or pattern from
+   <retrieved_context>. Each suggestion must cite which existing code it extends, which
+   architectural boundary it fits into, and how it integrates with the current tech stack.
+   Never suggest features that ignore the existing project structure, frameworks, or patterns.
+   Prefer identifying: incomplete TODOs, missing error handling, untested paths, stub
+   implementations, and natural extension points visible in the retrieved code.
+
 3. NEVER DO THESE
    - Do not invent function names, class names, or file paths not present in <retrieved_context>
    - Do not summarize without evidence
@@ -504,13 +518,16 @@ You are on step {current_iteration} of {max_iterations}.
 {available_tools}
 </available_tools>
 
+TOOL USAGE RULES (CRITICAL):
+- You MUST ONLY use tools listed in <available_tools> above.
+- Do NOT invent tools like "FileSystemTool", "NodeTool", "DockerTool", or other non-existent tools.
+- If you need to navigate directories, use TerminalTool with the cwd parameter, or use SearchTool.
+- Do NOT try to use methods that don't exist (e.g., "FileSystemTool.change_directory").
+
 FILE EDITING RULES (CRITICAL — follow these strictly):
-- To modify existing files (add a method, fix a bug, refactor code): ALWAYS use
-  FileEditorTool.replace_in_file(). Identify a unique target string near where
-  the change should go and replace it with the updated version including your addition.
-- To create brand new files that do not yet exist: use FileEditorTool.write_file().
-- NEVER use write_file() on an existing file unless you have read the ENTIRE file
-  first with read_file(). A partial rewrite will destroy code you cannot see.
+- To modify EXISTING files (add a method, fix a bug, refactor code): You MUST use FileEditorTool.replace_in_file(). Identify a unique target string near where the change should go and replace it with the updated version including your addition.
+- To create brand NEW files that do not yet exist: use FileEditorTool.write_file().
+- DO NOT use write_file() to edit existing files. The tool is hard-coded to reject overwriting existing files to prevent accidental deletions of code you cannot see.
 - Before editing any file, ALWAYS call FileEditorTool.read_file() to see the current
   content so you can construct an accurate target string.
 
@@ -532,8 +549,38 @@ FILE EDITING RULES (CRITICAL — follow these strictly):
 
 DECISION RULES — follow in order:
 
+⚠️ ACTION REQUEST OVERRIDE (CRITICAL — applies to ALL action/implementation requests):
+If the user's request contains action keywords like "implement", "add", "create", "build",
+"fix", "refactor", "update", "modify", "change", "write", "make", "setup", "configure",
+"enable", "disable", "remove", "delete", "rename" — you are being asked to EXECUTE an
+implementation, NOT explain how to do it.
+
+For action requests:
+  ✓ DO: Use FileEditorTool.read_file() → FileEditorTool.write_file/replace_in_file() to make actual changes
+  ✓ DO: Call tools that modify files, create directories, run tests, lint code
+  ✗ DO NOT: Provide step-by-step instructions of what someone else should do
+  ✗ DO NOT: Return final_answer with explanations like "Here's how to implement JWT..."
+
+You MUST use tools to execute the request until the changes are complete.
+Provide a final_answer ONLY after you have made the actual file modifications.
+
+0. CODEBASE-FIRST RULE (overrides rule 1 for open-ended questions):
+   If the user asks about features to add, improvements, suggestions, "what's missing",
+   or any brainstorming/ideation question about the project — you MUST first use tools
+   to read key project files (README.md, ARCHITECTURE.md, server.py, existing tool files,
+   component files) and search for TODO/FIXME/stub/placeholder patterns BEFORE answering.
+   Never generate feature suggestions from general knowledge. Every suggestion must be
+   grounded in a specific gap, TODO, incomplete pattern, or architectural opportunity
+   found in the actual codebase. If <accumulated_context> does not yet contain code from
+   this project's files, call FileEditorTool.read_file() or SearchTool first.
+
 1. If <accumulated_context> already contains enough information to fully answer
-   the user's request → return final_answer immediately. Do not call more tools.
+   the user's request AND it is a question (not an action request) → return final_answer immediately.
+   Do not call more tools.
+
+   NOTE: Action requests (see override rule above) are EXEMPT from this shortcut.
+   You must always use tools to execute implementation requests, even if you think you
+   understand what needs to be done.
 
 2. If a prior tool call in <accumulated_context> returned [Error] → do not retry
    the same tool.method with the same args. Try a different approach or answer
@@ -666,27 +713,42 @@ happens before mutations (write_file, replace_in_file).
 
 PLANNING RULES:
 
-1. READ BEFORE WRITE
-   Always read a file before modifying it. Never call write_file or replace_in_file
-   on a file you haven't read in a prior step.
+0. TOOL SELECTION (CRITICAL)
+   You MUST ONLY use tools listed in the <available_tools> section above.
+   Do NOT invent tools like FileSystemTool, NodeTool, DockerTool, etc.
+   For shell operations (install packages, run commands), use TerminalTool with the cwd parameter.
+   Each step must use a real tool from the list above, or `__action_loop__` for complex edits.
 
-2. MINIMAL STEPS
-   Use the fewest steps possible. Don't read files that aren't needed.
-   Combine related changes into a single replace_in_file when possible.
+1. STEP COUNT — match exactly to complexity (CRITICAL)
+   - "simple" (1-2 files): 1–3 steps MAX. No discovery steps, go straight to the change.
+   - "moderate" (3-5 files): 3–5 steps. At most ONE search step.
+   - "complex" (6+ files, refactors): 5–8 steps.
+   NEVER pad with extra search/read steps. If you already know the file from the file_structure, skip the search and act directly.
 
-3. DEPENDENCIES
+2. NO STUB FILES — do the real work (CRITICAL)
+   Do NOT create skeleton/placeholder/config-only files and call it done.
+   A step that creates a file must write the COMPLETE implementation, not a stub.
+   Use `__action_loop__` for complex implementations — it will read existing code and write the full solution.
+
+3. EDITING EXISTING FILES (CRITICAL)
+   You MUST NOT use `FileEditorTool.replace_in_file` directly in your plan. As the planner, you do not have the exact file contents yet, so you cannot provide the exact `target` and `replacement` strings.
+   Instead, to modify an existing file, use `__action_loop__` (method: `execute`). This delegates to a sub-agent that reads the file first and makes the targeted edit with full context.
+   Set args to: {{"question": "Read <filename> and <describe the exact change needed in detail>"}}
+
+   Note: You CAN use `FileEditorTool.write_file` directly, but ONLY for creating completely NEW files with full content.
+
+4. DEPENDENCIES
    If step B needs information from step A's output, include A's id in B's depends_on.
-   Steps with no dependencies can potentially run in parallel.
 
-4. VERIFICATION
+5. VERIFICATION
    For steps that modify code, add a verification field:
    - "run_lint" — run linter after the edit
    - "run_test" — run tests after the edit
    - "read_back" — read the file back to confirm the change
    Set to null for read-only steps.
 
-5. COMPLEXITY CLASSIFICATION
-   - "simple" — 1-2 file changes, straightforward edits
+6. COMPLEXITY CLASSIFICATION
+   - "simple" — 1-2 file changes, clear target files already visible in file_structure
    - "moderate" — 3-5 files, some coordination needed
    - "complex" — 6+ files, refactoring, or cross-cutting changes
 

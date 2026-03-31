@@ -24,7 +24,7 @@
   let abortController = null;
 
   // ── Agent mode state ──────────────────────────────────────────────────────
-  let agentMode = $state(false);
+  const agentMode = true;
   let agentPlan = $state(null);        // current plan from agent
   let agentChangeset = $state(null);   // changeset from completed agent task
   let agentAskPayload = $state(null);  // {question, options} when agent pauses
@@ -458,14 +458,6 @@
       {/if}
     </div>
     <div class="chat__header-right">
-      <button
-        class="chat__mode-toggle"
-        class:chat__mode-active={agentMode}
-        onclick={() => agentMode = !agentMode}
-        title={agentMode ? "Agent Mode: ON (Plan → Execute → Verify)" : "Chat Mode (Q&A)"}
-      >
-        {agentMode ? "🤖 Agent" : "💬 Chat"}
-      </button>
       <button class="chat__new" onclick={handleNewChat} title="New Chat">＋</button>
       <button class="chat__clear" onclick={clearChat} title="Clear view (doesn't delete history)">🗑️</button>
     </div>
@@ -706,21 +698,6 @@
     border-radius: var(--radius-sm); opacity: 0.5;
   }
   .chat__clear:hover { opacity: 1; background: var(--bg-hover); }
-
-  .chat__mode-toggle {
-    font-size: 11px; padding: 2px 8px;
-    border-radius: var(--radius-sm);
-    background: var(--bg-tertiary, #313244);
-    border: 1px solid var(--border);
-    color: var(--text-secondary);
-    cursor: pointer; transition: all 0.15s;
-  }
-  .chat__mode-toggle:hover { background: var(--bg-hover); }
-  .chat__mode-active {
-    background: var(--accent, #89b4fa) !important;
-    color: var(--bg-primary, #1e1e2e) !important;
-    border-color: var(--accent, #89b4fa) !important;
-  }
 
   .chat__agent-ask {
     background: var(--bg-tertiary, #313244);
