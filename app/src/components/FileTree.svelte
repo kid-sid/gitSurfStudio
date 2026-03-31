@@ -32,14 +32,19 @@
     const handleBranchChange = () => {
       if (workspacePath) loadFiles();
     };
+    const handleRefresh = () => {
+      if (workspacePath) loadFiles();
+    };
     const handleClickOutside = () => {
       contextMenu = { show: false, x: 0, y: 0, item: null };
     };
     window.addEventListener('branch-changed', handleBranchChange);
+    window.addEventListener('refresh-file-tree', handleRefresh);
     window.addEventListener('click', handleClickOutside);
 
     return () => {
       window.removeEventListener('branch-changed', handleBranchChange);
+      window.removeEventListener('refresh-file-tree', handleRefresh);
       window.removeEventListener('click', handleClickOutside);
     };
   });

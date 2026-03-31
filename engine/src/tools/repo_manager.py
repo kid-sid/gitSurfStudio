@@ -136,3 +136,109 @@ class RepoManager:
             message = error_data.get("message", "Unknown error")
             raise Exception(f"GitHub fork failed: {message}")
 
+
+class CacheManager:
+    """Manages lifecycle of the engine/.cache/ directory."""
+
+    INDEX_DIRS = {"vector_index", "bm25_index", "symbols", "call_graph"}
+    MAX_CACHED_REPOS = int(os.environ.get("GITSURF_CACHE_MAX_REPOS", "3"))
+
+    def __init__(self, cache_dir: str):
+        self.cache_dir = os.path.abspath(cache_dir)
+
+    def _dir_size_bytes(self, path: str) -> int:
+        import contextlib
+        total = 0
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for f in filenames:
+                with contextlib.suppress(OSError):
+                    total += os.path.getsize(os.path.join(dirpath, f))
+        return total
+
+    def list_cached_repos(self) -> list[dict]:
+        """List cloned repo directories (those containing .git/), sorted by mtime desc."""
+        repos = []
+        if not os.path.isdir(self.cache_dir):
+            return repos
+        for name in os.listdir(self.cache_dir):
+            full = os.path.join(self.cache_dir, name)
+            if os.path.isdir(full) and name not in self.INDEX_DIRS and os.path.isdir(os.path.join(full, ".git")):
+                try:
+                    mtime = os.path.getmtime(full)
+                except OSError:
+                    mtime = 0.0
+                repos.append({"name": name, "path": full, "mtime": mtime})
+        repos.sort(key=lambda r: r["mtime"], reverse=True)
+        return repos
+
+    def evict_old_repos(self, keep: int | None = None, exclude: str | None = None):
+        """Delete oldest cloned repos beyond the keep limit.
+
+        Args:
+            keep: Number of repos to retain (default: MAX_CACHED_REPOS).
+            exclude: safe_name of a repo that must never be deleted.
+        """
+        if keep is None:
+            keep = self.MAX_CACHED_REPOS
+        repos = self.list_cached_repos()
+        to_keep = repos[:keep]
+        to_delete = repos[keep:]
+        kept_names = {r["name"] for r in to_keep}
+        if exclude:
+            kept_names.add(exclude)
+        for repo in to_delete:
+            if repo["name"] in kept_names:
+                continue
+            print(f"[CacheManager] Evicting old repo: {repo['name']}")
+            shutil.rmtree(repo["path"], ignore_errors=True)
+
+    def cleanup_search_indexes(self):
+        """Delete all search index subdirectories (rebuilt lazily on next query)."""
+        for name in self.INDEX_DIRS:
+            idx_path = os.path.join(self.cache_dir, name)
+            if os.path.isdir(idx_path):
+                shutil.rmtree(idx_path, ignore_errors=True)
+
+    def get_cache_stats(self) -> dict:
+        """Return cache size, repo count, and per-index sizes."""
+        repos = self.list_cached_repos()
+        repo_list = []
+        for r in repos:
+            size_mb = round(self._dir_size_bytes(r["path"]) / (1024 * 1024), 2)
+            repo_list.append({
+                "name": r["name"],
+                "size_mb": size_mb,
+                "last_used": r["mtime"],
+            })
+
+        indexes = {}
+        for name in self.INDEX_DIRS:
+            idx_path = os.path.join(self.cache_dir, name)
+            if os.path.isdir(idx_path):
+                indexes[name] = round(self._dir_size_bytes(idx_path) / (1024 * 1024), 2)
+            else:
+                indexes[name] = 0.0
+
+        total = sum(r["size_mb"] for r in repo_list) + sum(indexes.values())
+        return {
+            "total_size_mb": round(total, 2),
+            "repo_count": len(repo_list),
+            "repos": repo_list,
+            "indexes": indexes,
+        }
+
+    def purge_all(self, exclude_active: str | None = None):
+        """Delete everything in .cache/ except the active workspace directory."""
+        if not os.path.isdir(self.cache_dir):
+            return
+        for name in os.listdir(self.cache_dir):
+            if exclude_active and name == exclude_active:
+                continue
+            full = os.path.join(self.cache_dir, name)
+            if os.path.isdir(full):
+                shutil.rmtree(full, ignore_errors=True)
+            else:
+                import contextlib
+                with contextlib.suppress(OSError):
+                    os.remove(full)
+

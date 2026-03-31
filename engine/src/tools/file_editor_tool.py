@@ -148,6 +148,53 @@ class FileEditorTool:
         except Exception as e:
             return f"[Error] Failed to replace in file: {e}"
 
+    def multi_replace_file_content(
+        self,
+        rel_path: str,
+        replacement_chunks: list
+    ) -> str:
+        """
+        Replaces multiple non-contiguous chunks in a file.
+        replacement_chunks: list of dicts with 'targetContent' and 'replacementContent'
+        """
+        try:
+            abs_path = self._get_abs_path(rel_path)
+            if not os.path.exists(abs_path):
+                return f"[Error] File not found: {rel_path}"
+
+            with open(abs_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Verify all targets exist EXACTLY once before making any changes
+            for i, chunk in enumerate(replacement_chunks):
+                target = chunk.get("targetContent", chunk.get("TargetContent", ""))
+                count = content.count(target)
+                if count == 0:
+                    return f"[Error] Target {i+1} not found in {rel_path}."
+                if count > 1:
+                    return f"[Error] Target {i+1} appears {count} times in {rel_path}. Provide a more specific target."
+
+            backup_result = self._write_backup(abs_path, content)
+            if backup_result:
+                print(f"   [FileEditor] Backup created: {backup_result}")
+
+            new_content = content
+            for chunk in replacement_chunks:
+                target = chunk.get("targetContent", chunk.get("TargetContent", ""))
+                replacement = chunk.get("replacementContent", chunk.get("ReplacementContent", ""))
+                new_content = new_content.replace(target, replacement, 1)
+
+            print(f"[UI_COMMAND] ai_writing_start {abs_path}")
+            with open(abs_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            print(f"[UI_COMMAND] file_changed {abs_path}")
+
+            lines_changed = abs(len(new_content.splitlines()) - len(content.splitlines()))
+            return f"[Success] Multi-replaced {len(replacement_chunks)} chunks in {rel_path}. Lines delta: {lines_changed:+d}."
+
+        except Exception as e:
+            return f"[Error] Failed to multi-replace in file: {e}"
+
     def _write_backup(self, abs_path: str, content: str) -> Optional[str]:
         """
         Writes a .bak copy of the file before mutation.

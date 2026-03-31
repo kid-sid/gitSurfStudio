@@ -43,23 +43,27 @@ FIELD INSTRUCTIONS:
 
 "intent": A single, concise verb phrase describing the user's technical goal (e.g., "Add tab switching to the Svelte frontend"). Derive this from both the request AND the project context. Max 15 words.
 
-"refined_question": A precise, jargon-correct restatement of the user's question, correcting typos and removing ambiguity. Should be answerable by a code search engine. Max 25 words.
+"refined_question": A precise, jargon-correct restatement of the user's request, correcting typos and removing ambiguity. Keep the same imperative form if the user gave a command (e.g., "Implement JWT auth" stays imperative, do NOT rephrase it as a question like "How can I...?"). Max 25 words.
 
 "keywords": An array of 5–10 technical search terms ranked by relevance. Prioritize:
-  1. Exact symbol names visible in <file_structure> (e.g., "App.svelte", "sidebar.js")
-  2. Framework/language-specific terms inferred from project context (e.g., "svelte store", "writable")
-  3. General programming concepts as a fallback (e.g., "tab component", "state management")
+  1. The core nouns/concepts from the user's ACTUAL question — these MUST come first.
+     Example: "What skills are available?" → first keyword MUST be "skills".
+     Example: "How is auth implemented?" → first keyword MUST be "auth".
+  2. Exact symbol names or folder names visible in <file_structure> that match
+     (e.g., "skills/", "auth.py", "sidebar.js")
+  3. Framework/language-specific terms inferred from project context
+  4. General programming concepts as a fallback
   Do NOT fabricate symbol names not present in the file structure.
-  FOR BRAINSTORMING / SUGGESTION REQUESTS ("what feature to add", "how to improve", "what's missing"):
-  Generate keywords that search for: TODO comments, FIXME markers, incomplete features, stub
-  implementations, error handling gaps, missing test coverage, and architectural boundary points
-  in the EXISTING codebase. Examples: "TODO", "FIXME", "NotImplementedError", "pass  # ",
-  "stub", "placeholder". Also include names of existing tools, components, and modules so
-  the search retrieves the current state of the code rather than generic concepts.
+  Do NOT replace the user's search terms with project-description terms.
 
-"is_action_request": true ONLY if the user is requesting a direct file mutation (edit, create, delete, rename, refactor). Set to false for all questions, how-tos, and explanations.
-
-"is_overview_question": true ONLY if the user wants high-level information about THIS PROJECT that can be answered from the README or project docs — e.g. "what does this do?", "explain the project", "give me an overview", "what is this?", "describe the architecture", "how do I run this?", "how to install?", "how to set up?", "how to get started?". Set to false if the question is about an EXTERNAL library, framework, or technology (e.g. "how does $state work in Svelte 5?", "what is FastAPI dependency injection?" — these require external docs, NOT the project README). Set to false for anything targeting a specific file, function, class, bug, or feature.
+"is_action_request": true if the user wants code to be created, edited, or changed in any way.
+  Imperative verbs are ALWAYS action requests: "implement", "add", "create", "build",
+  "set up", "integrate", "make", "fix", "refactor", "update", "delete", "rename",
+  "write", "install", "configure", "move", "extract", "split", "merge", "convert".
+  Example action requests: "Implement JWT auth", "Add a navbar", "Create a login page",
+  "Build a REST API", "Set up database models", "Fix the bug in X".
+  Set to false ONLY for pure questions seeking explanation or information — e.g.
+  "how does X work?", "what is Y?", "explain Z", "where is X defined?".
 
 "target_files": An array of filenames from <file_structure> most likely relevant to this request. Return an empty array [] if none are identifiable.
 
@@ -73,7 +77,6 @@ EXPECTED OUTPUT FORMAT:
   "refined_question": "string (max 25 words)",
   "keywords": ["str1", "str2", "..."],
   "is_action_request": boolean,
-  "is_overview_question": boolean,
   "target_files": ["filename1", "filename2"],
   "action_type": "edit" | "create" | "delete" | "rename" | "refactor" | null,
   "direct_tool_call": {{
@@ -345,18 +348,19 @@ def answer_question_prompt(
 
     action_block = f"""
 ACTION MODE: {action_type.upper() if action_type else "EDIT"}
-You are not writing an explanation. You are producing a direct file change.
+The file changes have ALREADY been applied to disk by the agent's tool calls.
+Your job now is to SUMMARIZE what was done — do NOT output full file contents or patches.
 
 Your response MUST follow this exact structure:
 
-REASONING:
-<2-3 sentences max explaining what you are changing and why>
+## Changes Made
+<Bullet list of every file created or modified, with a 1-line description of each change>
 
-PATCH:
-<file_path>
-```language
-<complete new file content or targeted diff>
-```
+## What Was Done
+<2-3 sentences explaining the overall change and why>
+
+## Next Steps (if any)
+<Optional: any manual steps the user still needs to take, e.g. install deps, restart server>
 
 CONFIDENCE: <HIGH | MEDIUM | LOW>
 LOW_CONFIDENCE_REASON: <only if CONFIDENCE is LOW — explain what context is missing>
@@ -530,6 +534,12 @@ FILE EDITING RULES (CRITICAL — follow these strictly):
 - DO NOT use write_file() to edit existing files. The tool is hard-coded to reject overwriting existing files to prevent accidental deletions of code you cannot see.
 - Before editing any file, ALWAYS call FileEditorTool.read_file() to see the current
   content so you can construct an accurate target string.
+- NEVER edit the same line/region of a file twice. If you already replaced a target
+  string in a prior step, that target no longer exists in the file — it was replaced.
+  Plan ALL changes to a single file in ONE replace_in_file call with the complete
+  replacement, rather than making multiple small edits to the same area.
+- For multi-file tasks, plan your changes upfront: decide which files to create and
+  which to modify BEFORE starting. Create new files first, then modify existing ones.
 
 <conversation_history>
 {history_str}
@@ -549,50 +559,60 @@ FILE EDITING RULES (CRITICAL — follow these strictly):
 
 DECISION RULES — follow in order:
 
-⚠️ ACTION REQUEST OVERRIDE (CRITICAL — applies to ALL action/implementation requests):
-If the user's request contains action keywords like "implement", "add", "create", "build",
-"fix", "refactor", "update", "modify", "change", "write", "make", "setup", "configure",
-"enable", "disable", "remove", "delete", "rename" — you are being asked to EXECUTE an
-implementation, NOT explain how to do it.
+1. CLASSIFY THE REQUEST:
+   - ACTION request = user wants code created, edited, fixed, deleted, refactored,
+     added, implemented, updated, or moved (e.g. "add a navbar", "fix the bug in X",
+     "create a login page", "implement JWT", "refactor Y to use Z").
+   - QUESTION request = user wants an explanation, search, or information
+     (e.g. "how does X work?", "what is Y?", "find where Z is defined").
 
-For action requests:
-  ✓ DO: Use FileEditorTool.read_file() → FileEditorTool.write_file/replace_in_file() to make actual changes
-  ✓ DO: Call tools that modify files, create directories, run tests, lint code
-  ✗ DO NOT: Provide step-by-step instructions of what someone else should do
-  ✗ DO NOT: Return final_answer with explanations like "Here's how to implement JWT..."
+2. For ACTION requests — EXECUTE, DON'T EXPLORE:
+   ALLOWED TOOLS: FileEditorTool only (read_file, write_file, replace_in_file).
+   DO NOT USE: SearchTool, SymbolPeekerTool, WebSearchTool, context7, sequential-thinking.
+   The relevant files are already in <accumulated_context>. Use them directly.
 
-You MUST use tools to execute the request until the changes are complete.
-Provide a final_answer ONLY after you have made the actual file modifications.
+   WORKFLOW — follow this exact sequence:
+   a) PLAN: On your first iteration, output your thought listing ALL files you will
+      create or modify. Example thought: "I will: 1) create engine/src/auth.py,
+      2) modify engine/server.py to add imports and middleware, 3) update requirements.txt"
+   b) CREATE new files first using FileEditorTool.write_file() — one call per file.
+      Write complete, production-ready code. Do NOT write skeleton/placeholder code.
+   c) MODIFY existing files using FileEditorTool.replace_in_file() — use the file
+      content from <accumulated_context> to find exact target strings.
+      If a file you need is NOT in <accumulated_context>, read it first with read_file().
+   d) FINISH: Only return final_answer AFTER all files are created and modified.
+      The final_answer should summarize what you did, not contain code.
 
-0. CODEBASE-FIRST RULE (overrides rule 1 for open-ended questions):
-   If the user asks about features to add, improvements, suggestions, "what's missing",
-   or any brainstorming/ideation question about the project — you MUST first use tools
-   to read key project files (README.md, ARCHITECTURE.md, server.py, existing tool files,
-   component files) and search for TODO/FIXME/stub/placeholder patterns BEFORE answering.
-   Never generate feature suggestions from general knowledge. Every suggestion must be
-   grounded in a specific gap, TODO, incomplete pattern, or architectural opportunity
-   found in the actual codebase. If <accumulated_context> does not yet contain code from
-   this project's files, call FileEditorTool.read_file() or SearchTool first.
+   CRITICAL RULES:
+   - Make ONE call per iteration. Do not return final_answer until ALL files are done.
+   - NEVER rewrite a file you already created. If you already used write_file() on a
+     file, that file is DONE — move on to the next file in your plan. If you need to
+     fix something in it, use replace_in_file() instead. Rewriting wastes iterations.
+   - PROGRESS THROUGH YOUR PLAN — each iteration must advance to a DIFFERENT step.
+     If iteration 1 creates file A, iteration 2 must create file B or modify file C.
+     Never redo the same step with a "better" version.
+   - Never edit the same region of a file twice — plan ALL changes to one file in a
+     single replace_in_file call.
+   - Do NOT re-read files that are already in <accumulated_context>.
 
-1. If <accumulated_context> already contains enough information to fully answer
-   the user's request AND it is a question (not an action request) → return final_answer immediately.
-   Do not call more tools.
+3. For QUESTION requests — VERIFY CONTEXT BEFORE ANSWERING:
+   a) Scan <project_structure> for files or folders whose names relate to the
+      user's question topic. Examples: user asks about "skills" → look for a
+      skills/ folder; user asks about "auth" → look for auth.py or auth/ directory.
+   b) If such files/folders exist but their content is NOT in <accumulated_context>,
+      use FileEditorTool.read_file() or SearchTool.search() to examine them BEFORE
+      returning final_answer.
+   c) Do NOT assume README or overview content is sufficient when specific source
+      files, config files, or dedicated directories exist for the topic.
+   d) Only return final_answer when your context includes the actual relevant source
+      files — not just summary documents that mention the topic in passing.
 
-   NOTE: Action requests (see override rule above) are EXEMPT from this shortcut.
-   You must always use tools to execute implementation requests, even if you think you
-   understand what needs to be done.
+4. If a prior tool call returned [Error] → do not retry with the same args. Try a
+   different approach or answer with what you have.
 
-2. If a prior tool call in <accumulated_context> returned [Error] → do not retry
-   the same tool.method with the same args. Try a different approach or answer
-   with what you have.
+5. Do NOT call the same tool.method with the same or similar args as a prior step.
 
-3. If you have already called the same tool.method with the same or similar args
-   in a prior step → do NOT repeat it. It will return the same result. This also
-   applies to alias names (e.g. mcp__context7__resolve-library-id and
-   resolve_library_id are the SAME tool). Instead, USE the data from the prior
-   observation to call a DIFFERENT tool or return final_answer.
-
-4. If this is the final iteration → return final_answer regardless of confidence.
+6. If this is the final iteration → return final_answer regardless of confidence.
    State what you found and what remains unknown.
 
 MCP TOOL ROUTING — use these external tools when the built-in tools are insufficient:
@@ -644,8 +664,9 @@ REMINDER: For ALL mcp__* tools, set "method": "execute". Never use the tool's na
 {"" if not is_last else """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🚨 FINAL ITERATION — THIS OVERRIDES ALL OTHER RULES 🚨
-You MUST return {{"action": "final_answer"}} right now.
-Do NOT call any tool. Do NOT wait for more information.
+- If this is an ACTION request and you have NOT yet called FileEditorTool to
+  make the change → use this iteration to call FileEditorTool NOW.
+- Otherwise, return {{"action": "final_answer"}} right now.
 Synthesize everything in <accumulated_context> into your best answer.
 If context is incomplete, state what you know and what was unavailable.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -740,6 +761,13 @@ PLANNING RULES:
 4. DEPENDENCIES
    If step B needs information from step A's output, include A's id in B's depends_on.
 
+4. GITSURF WORKFLOW (CRITICAL)
+   You MUST structure your plan perfectly following the below lifecycle:
+   - Phase 1 (Planning): Add a step to use FileEditorTool to write 'implementation_plan.md' describing all changes.
+   - Phase 1 (Approval): Add a step to use NotifyUserTool.notify_user to ask for approval on the plan. This step MUST depend on the plan generation step.
+   - Phase 2 (Execution): Write/edit the required files using FileEditorTool (write_file, replace_in_file, multi_replace_file_content). These must depend on the approval step.
+   - Phase 3 (Verification): Verify logic and use FileEditorTool to write 'walkthrough.md' detailing the accomplishments.
+
 5. VERIFICATION
    For steps that modify code, add a verification field:
    - "run_lint" — run linter after the edit
@@ -748,7 +776,7 @@ PLANNING RULES:
    Set to null for read-only steps.
 
 6. COMPLEXITY CLASSIFICATION
-   - "simple" — 1-2 file changes, clear target files already visible in file_structure
+   - "simple" — 1-2 file changes, straightforward edits
    - "moderate" — 3-5 files, some coordination needed
    - "complex" — 6+ files, refactoring, or cross-cutting changes
 

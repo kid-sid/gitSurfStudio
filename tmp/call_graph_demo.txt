@@ -1,0 +1,13 @@
+## Call Graph Context for `_is_overview_question`
+
+**Location**: `src\orchestrator.py` (lines 51-52)
+
+### Called By (upstream):
+- `run_local_pipeline` in `src\orchestrator.py`
+
+### Calls: *No known callees*
+
+### Call Chain (downstream):
+```
+└── _is_overview_question  (src\orchestrator.py:51)
+```
