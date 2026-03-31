@@ -1,5 +1,22 @@
 from typing import List, Dict, Optional
 
+
+def summarize_chat_prompt(existing_summary: str, messages: List[Dict]) -> str:
+    """Prompt for rolling chat summarization."""
+    msgs_text = "\n".join(
+        f"{m['role'].upper()}: {m['content'][:500]}" for m in messages
+    )
+    existing = f"\nPrevious summary to incorporate:\n{existing_summary}\n" if existing_summary else ""
+    return f"""Summarize the following coding assistant conversation.
+Focus on: key decisions made, files discussed or modified, bugs found, features implemented, and any user preferences expressed.
+{existing}
+Messages to summarize:
+{msgs_text}
+
+Produce a concise summary (max 500 words) that preserves all actionable technical context.
+Do NOT include greetings or meta-commentary. Write in past tense."""
+
+
 def refine_query_prompt(user_question: str, history_str: str, project_context: str, file_structure: str) -> str:
     return f"""You are a technical query analyzer for an AI-powered code editor. Your sole job is to convert a raw user request into a structured JSON object for use by downstream code search and editing tools.
 
@@ -36,6 +53,8 @@ FIELD INSTRUCTIONS:
 
 "is_action_request": true ONLY if the user is requesting a direct file mutation (edit, create, delete, rename, refactor). Set to false for all questions, how-tos, and explanations.
 
+"is_overview_question": true ONLY if the user wants high-level information about THIS PROJECT that can be answered from the README or project docs — e.g. "what does this do?", "explain the project", "give me an overview", "what is this?", "describe the architecture", "how do I run this?", "how to install?", "how to set up?", "how to get started?". Set to false if the question is about an EXTERNAL library, framework, or technology (e.g. "how does $state work in Svelte 5?", "what is FastAPI dependency injection?" — these require external docs, NOT the project README). Set to false for anything targeting a specific file, function, class, bug, or feature.
+
 "target_files": An array of filenames from <file_structure> most likely relevant to this request. Return an empty array [] if none are identifiable.
 
 "action_type": If is_action_request is true, classify as one of: "edit" | "create" | "delete" | "rename" | "refactor". If is_action_request is false, return null.
@@ -48,6 +67,7 @@ EXPECTED OUTPUT FORMAT:
   "refined_question": "string (max 25 words)",
   "keywords": ["str1", "str2", "..."],
   "is_action_request": boolean,
+  "is_overview_question": boolean,
   "target_files": ["filename1", "filename2"],
   "action_type": "edit" | "create" | "delete" | "rename" | "refactor" | null,
   "direct_tool_call": {{
@@ -475,18 +495,28 @@ def decide_action_prompt(
     max_iterations: int = 5,
 ) -> str:
     is_last = current_iteration >= max_iterations
-    iteration_warning = (
-        "\n⚠ FINAL ITERATION: You MUST return final_answer now. "
-        "Summarize what you know from the accumulated context."
-    ) if is_last else ""
 
     return f"""You are an autonomous software agent inside GitSurf Studio.
 You HAVE full capability to read, edit, create, and delete files on the user's local machine using your tools. Do not claim you cannot edit code. If asked to change code, use your tools to do so!
-You are on step {current_iteration} of {max_iterations}.{iteration_warning}
+You are on step {current_iteration} of {max_iterations}.
 
 <available_tools>
 {available_tools}
 </available_tools>
+
+FILE EDITING RULES (CRITICAL — follow these strictly):
+- To modify existing files (add a method, fix a bug, refactor code): ALWAYS use
+  FileEditorTool.replace_in_file(). Identify a unique target string near where
+  the change should go and replace it with the updated version including your addition.
+- To create brand new files that do not yet exist: use FileEditorTool.write_file().
+- NEVER use write_file() on an existing file unless you have read the ENTIRE file
+  first with read_file(). A partial rewrite will destroy code you cannot see.
+- Before editing any file, ALWAYS call FileEditorTool.read_file() to see the current
+  content so you can construct an accurate target string.
+
+<conversation_history>
+{history_str}
+</conversation_history>
 
 <project_structure>
 {project_structure[:3000]}
@@ -496,7 +526,6 @@ You are on step {current_iteration} of {max_iterations}.{iteration_warning}
 {context[:18000]}
 </accumulated_context>
 
-{history_str}
 <user_request>{user_question}</user_request>
 
 ---
@@ -510,31 +539,279 @@ DECISION RULES — follow in order:
    the same tool.method with the same args. Try a different approach or answer
    with what you have.
 
-3. If you have already called the same tool.method with the same args in a prior
-   step → do not repeat it. It will return the same result.
+3. If you have already called the same tool.method with the same or similar args
+   in a prior step → do NOT repeat it. It will return the same result. This also
+   applies to alias names (e.g. mcp__context7__resolve-library-id and
+   resolve_library_id are the SAME tool). Instead, USE the data from the prior
+   observation to call a DIFFERENT tool or return final_answer.
 
 4. If this is the final iteration → return final_answer regardless of confidence.
    State what you found and what remains unknown.
 
+MCP TOOL ROUTING — use these external tools when the built-in tools are insufficient:
+REMINDER: For ALL mcp__* tools, set "method": "execute". Never use the tool's native name as the method.
+
+5. Use WebSearchTool.fetch_docs when:
+   - The user asks how a library, framework, or package works (e.g. "how does $state work in Svelte 5?", "what's the FastAPI way to do Y?")
+   - You need accurate, up-to-date API docs that your training data may have wrong or outdated
+   - The user asks about syntax, method signatures, or config options for any dependency in package.json / requirements.txt
+   - PREFER this over generic WebSearchTool.search for library-specific questions
+   - CALL: {{"tool": "WebSearchTool", "method": "fetch_docs", "args": {{"library": "<lowercase library name>", "topic": "<specific topic or question>"}}}}
+   - EXAMPLES:
+       fetch_docs(library="svelte", topic="$state runes reactivity")
+       fetch_docs(library="fastapi", topic="dependency injection")
+       fetch_docs(library="tauri", topic="invoke command from frontend")
+       fetch_docs(library="supabase", topic="auth with sveltekit")
+   - If fetch_docs returns [Error], the error message tells you exactly what to do next — follow it.
+     Do NOT retry fetch_docs with the same or similar args. Switch to WebSearchTool.search() immediately.
+
+6. BROWSER TOOL ROUTING:
+
+   Use BrowserTool (preferred — handles multi-step workflows in one call):
+   - verify_page(url, checks): After UI/CSS changes, verify the page renders correctly.
+     Example: {{"tool": "BrowserTool", "method": "verify_page", "args": {{"url": "http://localhost:1420", "checks": "[\"sidebar\", \"navigation\"]"}}}}
+   - test_interaction(url, steps): Regression testing — click buttons, fill forms, verify outcomes.
+     Example: {{"tool": "BrowserTool", "method": "test_interaction", "args": {{"url": "http://localhost:1420", "steps": "[{{\"action\":\"click\",\"element\":\"Submit\"}},{{\"action\":\"snapshot\",\"expect\":\"Success\"}}]"}}}}
+   - debug_page(url): When backend logs look fine but the UI is broken — captures DOM, screenshot, and console errors.
+     Example: {{"tool": "BrowserTool", "method": "debug_page", "args": {{"url": "http://localhost:1420"}}}}
+   - scrape_rendered(url): Fetch content from SPAs that need JavaScript to render.
+     Example: {{"tool": "BrowserTool", "method": "scrape_rendered", "args": {{"url": "https://docs.example.com/api"}}}}
+
+   Use raw mcp__playwright__* tools ONLY for single atomic actions not covered by BrowserTool methods.
+
+   Browser rules:
+   - Always use absolute URLs (http://localhost:1420 for frontend, http://localhost:8002 for backend API)
+   - If verify_page checks fail, follow up with debug_page to get console errors
+   - For test_interaction steps, use element descriptions from prior snapshots, not guesses
+
+7. Use mcp__sequential-thinking__* when:
+   - The task requires planning across multiple files before making any edits
+   - The user asks you to design, architect, or refactor something non-trivial
+   - You are debugging a problem that spans more than 2 files and the root cause is unclear
+   - You need to reason through trade-offs before committing to an approach
+   - Use this BEFORE calling FileEditorTool on complex multi-step changes — think first, then act
+   - Call sequentialthinking with your reasoning problem; it returns a structured thought chain you can act on
+
 ---
 
+{"" if not is_last else """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚨 FINAL ITERATION — THIS OVERRIDES ALL OTHER RULES 🚨
+You MUST return {{"action": "final_answer"}} right now.
+Do NOT call any tool. Do NOT wait for more information.
+Synthesize everything in <accumulated_context> into your best answer.
+If context is incomplete, state what you know and what was unavailable.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""}
 TOOL CALL — return this shape if you need more information:
 {{
   "action": "tool_call",
   "tool": "<exact tool name from available_tools>",
-  "method": "<exact method name>",
+  "method": "<exact method name — for mcp__* tools this is ALWAYS 'execute'>",
   "args": {{"<param_name>": "<value>"}},
   "thought": "<one sentence: what specific information you expect this call to return>"
 }}
 
+IMPORTANT — MCP tool method rule:
+For ANY tool whose name starts with "mcp__", you MUST set "method": "execute".
+NEVER use the tool's native operation name (e.g. "browser_navigate", "resolve-library-id") as the method.
+The args dict maps directly to the tool's input parameters (* = required, ? = optional).
+
 FINAL ANSWER — return this shape when you have enough context:
 {{
   "action": "final_answer",
-  "content": "<your complete response to the user. Use beautiful Markdown formatting (bullet points, bold text, code blocks) to ensure maximum readability.>",
+  "content": "",
   "thought": "<one sentence: why you have sufficient context to answer now>"
+}}
+Note: Set "content" to "" — the answer text is generated separately via streaming.
+
+Return ONLY the JSON object. No markdown. No explanation."""
+
+def plan_task_prompt(
+    user_request: str,
+    project_context: str,
+    file_structure: str,
+    available_tools: str,
+    history_str: str,
+) -> str:
+    """Prompt to generate a structured execution plan from a user's coding request."""
+    return f"""You are a coding agent planner for GitSurf Studio, an AI-powered IDE.
+Your job is to break a user's coding request into a structured plan of tool calls
+that another agent will execute step by step.
+
+<project_context>
+{project_context}
+</project_context>
+
+<file_structure>
+{file_structure}
+</file_structure>
+
+<available_tools>
+{available_tools}
+</available_tools>
+
+<conversation_history>
+{history_str}
+</conversation_history>
+
+<user_request>
+{user_request}
+</user_request>
+
+TASK:
+Create a step-by-step plan to fulfill the user's request. Each step should be a
+single tool call. Order steps so that information-gathering (read_file, search)
+happens before mutations (write_file, replace_in_file).
+
+PLANNING RULES:
+
+1. READ BEFORE WRITE
+   Always read a file before modifying it. Never call write_file or replace_in_file
+   on a file you haven't read in a prior step.
+
+2. MINIMAL STEPS
+   Use the fewest steps possible. Don't read files that aren't needed.
+   Combine related changes into a single replace_in_file when possible.
+
+3. DEPENDENCIES
+   If step B needs information from step A's output, include A's id in B's depends_on.
+   Steps with no dependencies can potentially run in parallel.
+
+4. VERIFICATION
+   For steps that modify code, add a verification field:
+   - "run_lint" — run linter after the edit
+   - "run_test" — run tests after the edit
+   - "read_back" — read the file back to confirm the change
+   Set to null for read-only steps.
+
+5. COMPLEXITY CLASSIFICATION
+   - "simple" — 1-2 file changes, straightforward edits
+   - "moderate" — 3-5 files, some coordination needed
+   - "complex" — 6+ files, refactoring, or cross-cutting changes
+
+EXPECTED OUTPUT FORMAT:
+{{
+  "goal": "concise description of what the plan achieves",
+  "complexity": "simple" | "moderate" | "complex",
+  "estimated_files": <number of files that will be modified>,
+  "steps": [
+    {{
+      "description": "what this step does",
+      "tool": "ToolName",
+      "method": "method_name",
+      "args": {{"param": "value"}},
+      "depends_on": [],
+      "verification": null | "run_lint" | "run_test" | "read_back"
+    }}
+  ]
 }}
 
 Return ONLY the JSON object. No markdown. No explanation."""
+
+
+def replan_on_failure_prompt(
+    goal: str,
+    completed_summary: str,
+    failed_step: str,
+    error: str,
+    remaining_steps: str,
+    context: str,
+) -> str:
+    """Prompt to re-plan after a step failure."""
+    return f"""You are a coding agent planner. A step in your plan has failed.
+Re-plan the remaining steps to work around the failure and still achieve the goal.
+
+GOAL: {goal}
+
+COMPLETED STEPS:
+{completed_summary}
+
+FAILED STEP:
+{failed_step}
+
+ERROR:
+{error}
+
+REMAINING STEPS (original plan):
+{remaining_steps}
+
+CONTEXT FROM EXECUTION:
+{context}
+
+TASK:
+Create a revised plan for the remaining work. You may:
+- Retry the failed step with different arguments
+- Skip the failed step and find an alternative approach
+- Add new steps to gather more information before retrying
+
+Return ONLY a valid JSON object with the same format as the original plan
+(goal, complexity, estimated_files, steps). Steps should only include the
+NEW steps needed (completed steps will be preserved automatically).
+
+Return ONLY the JSON object. No markdown. No explanation."""
+
+
+def verify_step_prompt(
+    step_description: str,
+    tool_output: str,
+    expected_outcome: str,
+) -> str:
+    """Prompt to verify if a step completed successfully."""
+    return f"""Verify if this coding agent step completed successfully.
+
+STEP: {step_description}
+EXPECTED OUTCOME: {expected_outcome}
+
+TOOL OUTPUT:
+{tool_output[:3000]}
+
+Return ONLY a JSON object:
+{{
+  "success": true | false,
+  "reason": "brief explanation"
+}}"""
+
+
+def execute_step_prompt(
+    plan_summary: str,
+    current_step: str,
+    context: str,
+    available_tools: str,
+    action_history: str,
+) -> str:
+    """Prompt for the agent to decide how to execute a dynamic step."""
+    return f"""You are a coding agent executing a plan step by step.
+
+<plan>
+{plan_summary}
+</plan>
+
+<current_step>
+{current_step}
+</current_step>
+
+<available_tools>
+{available_tools}
+</available_tools>
+
+<action_history>
+{action_history}
+</action_history>
+
+<context>
+{context[:12000]}
+</context>
+
+Decide the exact tool call needed for this step.
+Return ONLY a JSON object:
+{{
+  "tool": "ToolName",
+  "method": "method_name",
+  "args": {{"param": "value"}},
+  "thought": "one sentence explaining your approach"
+}}"""
+
 
 def analyze_project_context_prompt(readme_content: str) -> str:
     return f"""Summarize this README into under 200 words.

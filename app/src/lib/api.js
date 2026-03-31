@@ -10,12 +10,13 @@ const ENGINE_URL = (typeof window !== "undefined" && window.location.hostname !=
 /**
  * Initializes a workspace (local or GitHub)
  * @param {string} input - Local path or GitHub URL
+ * @param {string|null} userId - Supabase user ID for persistent memory
  */
-export async function initWorkspace(input) {
+export async function initWorkspace(input, userId = null) {
   const response = await fetch(`${ENGINE_URL}/init`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input }),
+    body: JSON.stringify({ input, user_id: userId }),
   });
   if (!response.ok) {
     const error = await response.json();
@@ -63,6 +64,58 @@ export async function writeFile(path, content) {
 }
 
 /**
+ * Creates a directory
+ * @param {string} path - Relative or absolute path
+ */
+export async function createDirectory(path) {
+  const response = await fetch(`${ENGINE_URL}/mkdir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to create directory");
+  }
+  return await response.json();
+}
+
+/**
+ * Renames (moves) a file or directory
+ * @param {string} oldPath - Current relative or absolute path
+ * @param {string} newPath - Desired relative or absolute path
+ */
+export async function renameEntry(oldPath, newPath) {
+  const response = await fetch(`${ENGINE_URL}/rename`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ old_path: oldPath, new_path: newPath }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to rename");
+  }
+  return await response.json();
+}
+
+/**
+ * Recursively deletes a directory
+ * @param {string} path - Directory path
+ */
+export async function deleteDirectory(path) {
+  const response = await fetch(`${ENGINE_URL}/delete-dir`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to delete directory");
+  }
+  return await response.json();
+}
+
+/**
  * Checks if the engine is online
  */
 export async function checkHealth() {
@@ -87,7 +140,7 @@ const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
  * @param {Function} onCommand - Callback for UI commands (e.g. open_file)
  * @param {AbortSignal} signal - Optional AbortSignal to cancel the request
  */
-export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal) {
+export async function sendChat(query, path, history = [], onLog, onAnswer, onCommand, signal, userId = null, agentMode = false) {
   // Always enforce a 5-minute timeout; combine with caller's abort signal when provided
   const timeoutSignal = AbortSignal.timeout(CHAT_TIMEOUT_MS);
   const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -95,7 +148,7 @@ export async function sendChat(query, path, history = [], onLog, onAnswer, onCom
   const response = await fetch(`${ENGINE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, path, history }),
+    body: JSON.stringify({ query, path, history, user_id: userId, agent_mode: agentMode }),
     signal: combinedSignal,
   });
 
@@ -123,7 +176,12 @@ export async function sendChat(query, path, history = [], onLog, onAnswer, onCom
           onLog(data.content);
         } else if (data.type === "ui_command" && onCommand) {
           onCommand(data.command, data.args);
+        } else if (data.type === "answer_token") {
+          // Streaming token — accumulate and notify progressively
+          fullAnswer += data.content;
+          if (onAnswer) onAnswer(fullAnswer);
         } else if (data.type === "answer") {
+          // Non-streaming fallback (mock provider) — deliver all at once
           fullAnswer += data.content;
           if (onAnswer) onAnswer(fullAnswer);
         }
@@ -290,6 +348,187 @@ export async function gitDiscard(path, file) {
 }
 
 /**
+ * Deletes the .bak backup file after accept or reject
+ * @param {string} path - Absolute path to the original file
+ */
+export async function cleanupBackup(path) {
+  const response = await fetch(`${ENGINE_URL}/cleanup-backup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to cleanup backup");
+  }
+  return await response.json();
+}
+
+/**
+ * Restores a file from its .bak backup (created before AI edits)
+ * @param {string} path - Absolute path to the file
+ */
+export async function restoreFile(path) {
+  const response = await fetch(`${ENGINE_URL}/restore`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to restore file");
+  }
+  return await response.json();
+}
+
+/**
+ * Deletes a newly AI-created file when the user rejects it
+ * @param {string} path - Absolute path to the file
+ */
+export async function deleteFile(path) {
+  const response = await fetch(`${ENGINE_URL}/delete-file`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to delete file");
+  }
+  return await response.json();
+}
+
+/**
+ * Gets an inline code completion from the LLM
+ * @param {string} path - File URI or path (for context)
+ * @param {string} prefix - Code before cursor
+ * @param {string} suffix - Code after cursor
+ * @param {string} language - Language ID
+ */
+export async function getCompletion(path, prefix, suffix, language = "plaintext") {
+  const response = await fetch(`${ENGINE_URL}/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, prefix, suffix, language }),
+  });
+  if (!response.ok) return null;
+  return await response.json();
+}
+
+/**
+ * Peeks the definition of a symbol by name (F12 / Go to Definition)
+ * @param {string} name - Symbol name (function, class, method)
+ * @returns {{ symbol: string, results: Array<{file,type,name,start_line,end_line,content}> }}
+ */
+export async function peekSymbol(name) {
+  const response = await fetch(`${ENGINE_URL}/peek-symbol?name=${encodeURIComponent(name)}`);
+  if (!response.ok) return { symbol: name, results: [] };
+  return await response.json();
+}
+
+/**
+ * Returns added/modified line numbers vs HEAD for a file (for gutter decorations)
+ * @param {string} path - Absolute path to the file
+ */
+export async function getGitDiffLines(path) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/git/diff-lines?path=${encodeURIComponent(path)}`);
+    if (!response.ok) return { added: [], modified: [] };
+    return await response.json();
+  } catch {
+    return { added: [], modified: [] };
+  }
+}
+
+// ── Chat Session Management ───────────────────────────────────────────────────
+
+/**
+ * Lists chat sessions for a user+repo (newest first).
+ * @param {string} userId
+ * @param {string} repoIdentifier
+ */
+export async function getChatSessions(userId, repoIdentifier) {
+  try {
+    const url = `${ENGINE_URL}/chat/sessions?user_id=${encodeURIComponent(userId)}&repo_identifier=${encodeURIComponent(repoIdentifier)}`;
+    const response = await fetch(url);
+    if (!response.ok) return { sessions: [] };
+    return await response.json();
+  } catch {
+    return { sessions: [] };
+  }
+}
+
+/**
+ * Creates a new chat session.
+ * @param {string} userId
+ * @param {string} repoIdentifier
+ * @param {string|null} title
+ */
+export async function createChatSession(userId, repoIdentifier, title = null) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/chat/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, repo_identifier: repoIdentifier, title }),
+    });
+    if (!response.ok) return { session_id: null };
+    return await response.json();
+  } catch {
+    return { session_id: null };
+  }
+}
+
+/**
+ * Loads messages for a session (for displaying history).
+ * @param {string} sessionId
+ */
+export async function loadSessionMessages(sessionId) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
+    if (!response.ok) return { messages: [] };
+    return await response.json();
+  } catch {
+    return { messages: [] };
+  }
+}
+
+/**
+ * Deletes a chat session.
+ * @param {string} sessionId
+ */
+export async function deleteChatSession(sessionId) {
+  try {
+    const response = await fetch(`${ENGINE_URL}/chat/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Lints file content via the backend (ruff for Python, eslint for JS/TS)
+ * @param {string} filePath - File path (for language detection)
+ * @param {string} content - Current editor content
+ * @param {string} workspace - Workspace root path
+ * @returns {Promise<{diagnostics: Array}>}
+ */
+export async function lintCode(filePath, content, workspace = "") {
+  try {
+    const response = await fetch(`${ENGINE_URL}/lint`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_path: filePath, content, workspace }),
+    });
+    if (!response.ok) return { diagnostics: [] };
+    return await response.json();
+  } catch {
+    return { diagnostics: [] };
+  }
+}
+
+/**
  * Fetches symbols for a given path
  * @param {string} path - Absolute path to the file or directory
  * @param {string} workspace - Optional workspace root to resolve relative path
@@ -297,8 +536,77 @@ export async function gitDiscard(path, file) {
 export async function getSymbols(path, workspace) {
   let url = `${ENGINE_URL}/symbols?path=${encodeURIComponent(path)}`;
   if (workspace) url += `&workspace=${encodeURIComponent(workspace)}`;
-  
+
   const response = await fetch(url);
   if (!response.ok) throw new Error("Failed to fetch symbols");
+  return await response.json();
+}
+
+
+// ── Agent API ─────────────────────────────────────────────────────────────
+
+/**
+ * Rollback agent changes — all files or a single file
+ * @param {string} changesetId - The changeset to rollback
+ * @param {string|null} filePath - Optional specific file to rollback
+ */
+export async function agentRollback(changesetId, filePath = null) {
+  const response = await fetch(`${ENGINE_URL}/agent/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ changeset_id: changesetId, file_path: filePath }),
+  });
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.detail || "Rollback failed");
+  }
+  return await response.json();
+}
+
+/**
+ * Accept agent changes — clean up backups
+ * @param {string} changesetId - The changeset to accept
+ */
+export async function agentAccept(changesetId) {
+  const response = await fetch(`${ENGINE_URL}/agent/accept`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ changeset_id: changesetId }),
+  });
+  if (!response.ok) throw new Error("Accept failed");
+  return await response.json();
+}
+
+/**
+ * Cancel the currently running agent task
+ */
+export async function agentCancel() {
+  const response = await fetch(`${ENGINE_URL}/agent/cancel`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error("Cancel failed");
+  return await response.json();
+}
+
+/**
+ * Send a user response to a paused agent (human-in-the-loop)
+ * @param {string} userResponse - The user's answer
+ */
+export async function agentRespond(userResponse) {
+  const response = await fetch(`${ENGINE_URL}/agent/respond`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ response: userResponse }),
+  });
+  if (!response.ok) throw new Error("Respond failed");
+  return await response.json();
+}
+
+/**
+ * List all active changesets
+ */
+export async function listChangesets() {
+  const response = await fetch(`${ENGINE_URL}/agent/changesets`);
+  if (!response.ok) throw new Error("Failed to list changesets");
   return await response.json();
 }

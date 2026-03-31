@@ -145,6 +145,9 @@
             class="file-path" 
             title={change.path} 
             onclick={() => onfileselect?.({ detail: { path: workspacePath + '/' + change.path } })}
+            onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { onfileselect?.({ detail: { path: workspacePath + '/' + change.path } }); } }}
+            role="button"
+            tabindex="0"
             style="cursor: pointer"
           >
             {change.path.split(/[/\\]/).pop()}

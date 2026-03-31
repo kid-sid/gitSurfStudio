@@ -68,14 +68,14 @@
     background: #238636;
     color: white;
     border: none;
-    padding: 4px 12px;
+    padding: 3px 10px;
     border-radius: 6px;
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 600;
     cursor: pointer;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
   }
   .fork-button:hover:not(:disabled) {
     background: #2ea043;

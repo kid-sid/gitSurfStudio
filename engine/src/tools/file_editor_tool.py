@@ -42,16 +42,27 @@ class FileEditorTool:
             abs_path = self._get_abs_path(rel_path)
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
 
-            # Backup existing file before overwriting
-            if os.path.exists(abs_path):
+            is_new_file = not os.path.exists(abs_path)
+
+            # Backup existing file before overwriting (only for existing files)
+            if not is_new_file:
                 with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                     existing = f.read()
                 backup_result = self._write_backup(abs_path, existing)
                 if backup_result:
                     print(f"   [FileEditor] Backup created: {backup_result}")
 
+            # Signal UI that AI is about to write this file
+            print(f"[UI_COMMAND] ai_writing_start {abs_path}")
+
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
+
+            # Signal UI: new files use file_created so the editor shows Keep/Delete
+            if is_new_file:
+                print(f"[UI_COMMAND] file_created {abs_path}")
+            else:
+                print(f"[UI_COMMAND] file_changed {abs_path}")
 
             line_count = len(content.splitlines())
             return f"[Success] Wrote {rel_path} ({line_count} lines)."
@@ -115,8 +126,10 @@ class FileEditorTool:
 
             new_content = original_content.replace(target, replacement) if allow_multiple else original_content.replace(target, replacement, 1)
 
+            print(f"[UI_COMMAND] ai_writing_start {abs_path}")
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
+            print(f"[UI_COMMAND] file_changed {abs_path}")
 
             lines_changed = abs(
                 len(new_content.splitlines()) - len(original_content.splitlines())

@@ -7,6 +7,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.bak
 venv/
 .venv/
 engine/.cache/
@@ -22,6 +23,7 @@ engine/symbol_minimap.json
 app/node_modules/
 app/dist/
 app/.svelte-kit/
+app/.env
 .DS_Store
 *.log
 
@@ -53,3 +55,8 @@ test*
 .history
 antigravity.MD
 CLAUDE.md
+
+supabase
+
+.pytest_cache
+.claude/
