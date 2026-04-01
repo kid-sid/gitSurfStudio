@@ -9,7 +9,7 @@ GitSurf Studio transforms the power of the GitSurf AI engine into a professional
 ## ✨ Key Features
 
 - 🚀 **Zero Cold-Start AI**: Persistent FastAPI daemon keeps models and search indexes ready in RAM for instant responses.
-- 🤖 **PRAR Agent Engine**: A "Perceive-Reason-Act-Reflect" loop with up to 8 reasoning iterations, precise tool routing, and target file prediction.
+- 🤖 **PRAR Agent Engine**: A "Perceive-Reason-Act-Reflect" loop with up to 15 reasoning iterations for action requests (8 for Q&A, 25 for multi-step agent plans), precise tool routing, and target file prediction.
 - 🔌 **MCP Tool Integration**: Native Model Context Protocol client — connects to Playwright (browser automation), Context7 (live library docs), and Sequential Thinking (structured reasoning) out of the box. Extensible via `engine/mcp_config.json`.
 - 📂 **Multi-Tab Editor**: Monaco Editor with syntax highlighting, inline completions, real-time linting (ruff / eslint), and git gutter indicators.
 - 🛡️ **Safe File Editing**: `replace_in_file` with occurrence validation and automatic `.bak` backups; AI diffs shown with Keep/Reject UI.
@@ -26,25 +26,30 @@ GitSurf Studio follows a **Thin Client, Smart Backend** monorepo structure:
 
 ```text
 gitSurfStudio/
-├── engine/                  # Python AI Backend (FastAPI + PRAR Pipeline)
+├── engine/                    # Python AI Backend (FastAPI + PRAR Pipeline)
 │   ├── src/
-│   │   ├── orchestrator.py  # PRAR pipeline + ReAct action loop
-│   │   ├── llm_client.py    # Dual-model LLM abstraction (gpt-4o / gpt-4o-mini)
-│   │   ├── prompts.py       # All prompt templates + MCP routing rules
-│   │   ├── tools/           # FileEditorTool, GitTool, SearchTool, LintTool, etc.
-│   │   ├── mcp/             # MCP client: MCPClientManager + MCPToolProxy
-│   │   └── memory/          # Supabase-backed symbol cache + chat sessions
-│   ├── mcp_config.json      # MCP server declarations (Playwright, Context7, Sequential Thinking)
-│   ├── server.py            # FastAPI server + tool registry + MCP background init
-│   └── .env                 # API keys (OpenAI, GitHub, Supabase, Tavily)
+│   │   ├── engine_state.py    # Global EngineState singleton (tools, LLM, MCP, memory)
+│   │   ├── tool_registry.py   # AVAILABLE_TOOLS definitions + tool registration
+│   │   ├── orchestrator.py    # PRAR pipeline + ReAct action loop
+│   │   ├── llm_client.py      # Dual-model LLM abstraction (gpt-4o / gpt-4o-mini)
+│   │   ├── prompts.py         # All prompt templates + MCP routing rules
+│   │   ├── routes/            # FastAPI route modules (chat, git, workspace, agent, …)
+│   │   ├── tools/             # FileEditorTool, GitTool, SearchTool, BrowserTool, etc.
+│   │   ├── agent/             # Planner, Executor, Changeset, ContextManager
+│   │   ├── mcp/               # MCP client: MCPClientManager + MCPToolProxy
+│   │   └── memory/            # Supabase-backed symbol cache + chat sessions
+│   ├── mcp_config.json        # MCP server declarations (Playwright, Context7, Sequential Thinking)
+│   ├── server.py              # FastAPI app assembly + route registration
+│   └── .env                   # API keys (OpenAI, GitHub, Supabase, Tavily)
 │
-└── app/                     # Native Desktop Frontend
+└── app/                       # Native Desktop Frontend
     ├── src/
-    │   ├── App.svelte        # Root layout + workspace init + MCP status polling
-    │   ├── lib/api.js        # All engine API calls
-    │   ├── lib/supabase.js   # Auth + workspace persistence
-    │   └── components/       # ChatPanel, CodeEditor, FileTree, GitPanel, StatusBar, Terminal
-    └── src-tauri/            # Rust native shell
+    │   ├── App.svelte          # Root layout + workspace init + MCP status polling
+    │   ├── lib/api.js          # All engine API calls
+    │   ├── lib/supabase.js     # Auth + workspace persistence
+    │   └── components/         # ChatPanel, CodeEditor, FileTree, GitPanel, StatusBar,
+    │                           # Terminal, AgentProgress, DiffOverlay, PreviewPanel, …
+    └── src-tauri/              # Rust native shell
 ```
 
 ---
