@@ -220,6 +220,7 @@ class HealthResponse(BaseModel):
 class InitResponse(BaseModel):
     status: str
     workspace_path: str
+    terminal_cwd: str
     has_project_context: bool
     is_github: bool
 

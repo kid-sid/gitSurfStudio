@@ -88,9 +88,14 @@ async def init_workspace(request: Request, req: InitRequest):
 
     _ensure_initialized(target_path)
 
+    # For GitHub repos the workspace_path is a cache clone — the terminal should
+    # open in the user's home dir, not deep inside the analysis cache.
+    terminal_cwd = os.path.expanduser("~") if is_github else target_path
+
     return {
         "status": "success",
         "workspace_path": target_path,
+        "terminal_cwd": terminal_cwd,
         "has_project_context": bool(state.project_context),
         "is_github": is_github,
     }

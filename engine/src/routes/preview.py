@@ -29,19 +29,23 @@ class PreviewStopRequest(BaseModel):
     workspace: str | None = None
 
 
-# Well-known dev server commands by project type
+# Well-known dev server commands by project type.
+# Use explicit binary invocations (npx vite / npx next dev) rather than
+# "npm run dev" so we avoid picking up --open flags that project maintainers
+# may have baked into their package.json scripts.  BROWSER=none is also
+# injected into the subprocess env (see start_preview) for tools that honour it.
 _DEV_COMMANDS = [
     # (detection file, command, default port)
-    ("package.json", "npm run dev", 5173),
-    ("vite.config.ts", "npm run dev", 5173),
-    ("vite.config.js", "npm run dev", 5173),
-    ("next.config.js", "npm run dev", 3000),
-    ("next.config.mjs", "npm run dev", 3000),
-    ("nuxt.config.ts", "npm run dev", 3000),
-    ("svelte.config.js", "npm run dev", 5173),
-    ("manage.py", "python manage.py runserver 0.0.0.0:8000", 8000),
-    ("app.py", "python app.py", 5000),
-    ("main.py", "python main.py", 8000),
+    ("vite.config.ts",  "npx vite",                                5173),
+    ("vite.config.js",  "npx vite",                                5173),
+    ("next.config.js",  "npx next dev",                            3000),
+    ("next.config.mjs", "npx next dev",                            3000),
+    ("nuxt.config.ts",  "npx nuxt dev",                            3000),
+    ("svelte.config.js","npx vite",                                5173),
+    ("package.json",    "npm run dev",                             5173),
+    ("manage.py",       "python manage.py runserver 0.0.0.0:8000", 8000),
+    ("app.py",          "python app.py",                           5000),
+    ("main.py",         "python main.py",                          8000),
 ]
 
 
@@ -89,12 +93,19 @@ async def start_preview(req: PreviewStartRequest):
 
     try:
         is_win = sys.platform == "win32"
+        # Prevent dev servers from auto-opening a browser window/tab.
+        # BROWSER=none is respected by Create React App, webpack-dev-server,
+        # and many other Node.js dev tools.
+        proc_env = os.environ.copy()
+        proc_env["BROWSER"] = "none"
+        proc_env["BROWSER_ARGS"] = ""
         proc = subprocess.Popen(
             command,
             shell=True,
             cwd=workspace,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=proc_env,
             # Use process group so we can kill the whole tree
             creationflags=(
                 subprocess.CREATE_NEW_PROCESS_GROUP if is_win else 0

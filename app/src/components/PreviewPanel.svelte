@@ -75,6 +75,7 @@
     {#if previewUrl}
       <span class="preview__url">{previewUrl}</span>
       <button class="preview__btn" onclick={handleRefresh} title="Refresh">↻</button>
+      <a class="preview__btn preview__btn--newtab" href={previewUrl} target="_blank" rel="noopener noreferrer" title="Open in new tab">⬡</a>
       <button class="preview__btn preview__btn--stop" onclick={handleStop} title="Stop server">■</button>
     {:else}
       <button
@@ -171,6 +172,10 @@
   }
   .preview__btn--start:hover { background: rgba(63, 185, 80, 0.2); }
   .preview__btn--start:disabled { opacity: 0.4; cursor: not-allowed; }
+  .preview__btn--newtab {
+    text-decoration: none; display: inline-flex; align-items: center; justify-content: center;
+    color: var(--text-secondary);
+  }
   .preview__btn--stop {
     color: #f85149; border-color: rgba(248, 81, 73, 0.4);
   }

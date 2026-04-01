@@ -60,3 +60,4 @@ supabase
 
 .pytest_cache
 .claude/
+.playwright-mcp/
