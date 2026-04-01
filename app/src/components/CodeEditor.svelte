@@ -5,7 +5,7 @@
   import EditorTabBar from "./EditorTabBar.svelte";
   import DiffOverlay from "./DiffOverlay.svelte";
 
-  let { activeFile = $bindable(""), openFiles = $bindable([]), workspacePath = "" } = $props();
+  let { activeFile = $bindable(""), openFiles = $bindable([]), workspacePath = "", onrun = null } = $props();
 
   // Per-file state
   let filesState = $state({});
@@ -758,6 +758,7 @@
     {pendingDiff}
     onclose={handleCloseTab}
     onsave={handleSave}
+    {onrun}
   />
 
   <DiffOverlay

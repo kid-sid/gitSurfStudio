@@ -43,7 +43,7 @@ async def terminal_ws(websocket: WebSocket, cwd: Optional[str] = None):
             return
 
         try:
-            pty_proc = PtyProcess.spawn("cmd.exe", dimensions=(24, 220), cwd=cwd)
+            pty_proc = PtyProcess.spawn("powershell.exe", dimensions=(24, 220), cwd=cwd)
         except Exception as e:
             await websocket.send_text(f"\r\n\x1b[31m[PTY failed to start: {e}]\x1b[0m\r\n")
             await websocket.close()

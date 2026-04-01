@@ -31,6 +31,7 @@
   let isAuthenticated = $state(false);
   let activeSidebarView = $state("explorer"); // "explorer" or "git"
   let showTerminal = $state(false);
+  let terminalCwd = $state("");
   let showPreview = $state(false);
   let recentWorkspaces = $state([]);
   let mcpReady = $state(false);
@@ -122,6 +123,7 @@
       const { data: { user: initUser } } = await supabase.auth.getUser();
       const res = await initWorkspace(initInput.trim(), initUser?.id ?? null);
       workspacePath = res.workspace_path;
+      terminalCwd = res.terminal_cwd || res.workspace_path;
       isGitHubRepo = res.is_github;
 
       // Bug 3: guard against 409 race condition — upsert is idempotent, silence duplicates
@@ -241,6 +243,34 @@
         goHome();
         break;
     }
+  }
+
+  function getRunCommand(filePath) {
+    const ext = filePath.split('.').pop()?.toLowerCase();
+    const p = filePath.replace(/\\/g, '/');
+    switch (ext) {
+      case 'py':   return `python "${p}"`;
+      case 'js': case 'jsx': case 'mjs': return `node "${p}"`;
+      case 'ts': case 'tsx': return `npx ts-node "${p}"`;
+      case 'sh': case 'bash': return `bash "${p}"`;
+      case 'go':   return `go run "${p}"`;
+      case 'rb':   return `ruby "${p}"`;
+      case 'php':  return `php "${p}"`;
+      case 'rs':   return `cargo run`;
+      case 'c':    return `gcc "${p}" -o /tmp/out && /tmp/out`;
+      case 'cpp':  return `g++ "${p}" -o /tmp/out && /tmp/out`;
+      default:     return null;
+    }
+  }
+
+  function handleRunFile(filePath) {
+    const cmd = getRunCommand(filePath);
+    if (!cmd) return;
+    showTerminal = true;
+    // Give the terminal time to connect before sending the command
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('terminal-send-command', { detail: { command: cmd } }));
+    }, 400);
   }
 
   function goHome() {
@@ -394,6 +424,7 @@
             bind:activeFile={activeFile}
             bind:openFiles={openFiles}
             {workspacePath}
+            onrun={handleRunFile}
           />
         </main>
         {#if showTerminal}
@@ -404,7 +435,7 @@
               <button class="terminal-area__close" onclick={() => showTerminal = false} title="Close Terminal">×</button>
             </div>
             <div class="terminal-area__body">
-              <TerminalPanel {workspacePath} bind:isOpen={showTerminal} />
+              <TerminalPanel workspacePath={terminalCwd} bind:isOpen={showTerminal} />
             </div>
           </div>
         {/if}

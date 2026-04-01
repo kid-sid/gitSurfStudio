@@ -6,7 +6,16 @@
     pendingDiff = null,
     onclose = null,
     onsave = null,
+    onrun = null,
   } = $props();
+
+  const RUNNABLE_EXTS = new Set(['py', 'js', 'jsx', 'mjs', 'ts', 'tsx', 'sh', 'bash', 'go', 'rb', 'php', 'rs', 'c', 'cpp']);
+
+  function canRun(path) {
+    if (!path) return false;
+    const ext = path.split('.').pop()?.toLowerCase();
+    return RUNNABLE_EXTS.has(ext);
+  }
 
   function handleCloseClick(path, e) {
     e.stopPropagation();
@@ -62,6 +71,15 @@
         title="Save (Ctrl+S)"
       >
         {f.isSaving ? "Saving..." : "Save"}
+      </button>
+    {/if}
+    {#if activeFile && canRun(activeFile)}
+      <button
+        class="run-button"
+        onclick={() => onrun?.(activeFile)}
+        title="Run file in terminal"
+      >
+        ▶ Run
       </button>
     {/if}
   </div>
@@ -126,4 +144,11 @@
   }
   .save-button:hover:not(:disabled) { filter: brightness(1.1); }
   .save-button:disabled { opacity: 0.3; cursor: default; }
+
+  .run-button {
+    background: rgba(63, 185, 80, 0.15); color: var(--accent-green); border: 1px solid rgba(63, 185, 80, 0.4);
+    padding: 4px 12px; border-radius: 4px; font-size: 11px;
+    font-weight: 600; cursor: pointer; transition: background 0.2s, border-color 0.2s;
+  }
+  .run-button:hover { background: rgba(63, 185, 80, 0.28); border-color: rgba(63, 185, 80, 0.7); }
 </style>

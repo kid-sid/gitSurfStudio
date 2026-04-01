@@ -9,32 +9,43 @@ This document describes the system architecture, data flows, and key design deci
 GitSurf Studio follows a **Thin Client, Smart Backend** architecture. The Svelte/Tauri frontend handles display and user interaction; all AI reasoning, file operations, and tool execution happen in the Python backend.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Svelte 5 / Tauri Frontend  (app/)                          │
-│  Monaco Editor · FileTree · ChatPanel · GitPanel · Terminal  │
-└────────────────────────┬────────────────────────────────────┘
-                         │  REST + NDJSON streaming (SSE)
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  FastAPI Engine  (engine/server.py : port 8002)             │
-│  Global EngineState · Tool Registry · MCP Manager           │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  PRAR Orchestrator  (engine/src/orchestrator.py)            │
-│  run_local_pipeline · run_code_aware_pipeline               │
-│  execute_action_loop (up to 8 ReAct iterations)             │
-└──────────┬───────────────────────────────────┬──────────────┘
-           │                                   │
-    Built-in Tools                        MCP Tools
-    ──────────────                        ─────────
-    FileEditorTool                        mcp__playwright__*
-    GitTool                               mcp__context7__*
-    SearchTool (ripgrep)                  mcp__sequential-thinking__*
-    WebSearchTool (Tavily)
-    SymbolPeekerTool
-    LintTool
+┌────────────────────────────────────────────────────────────────────┐
+│  Svelte 5 / Tauri Frontend  (app/)                                 │
+│  Monaco Editor · FileTree · ChatPanel · GitPanel · TerminalPanel   │
+│  AgentProgress · DiffOverlay · PreviewPanel · ChangeReview         │
+└───────────────────────────┬────────────────────────────────────────┘
+                            │  REST + NDJSON streaming (SSE) + WebSocket
+                            ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  FastAPI Engine  (engine/server.py : port 8002)                    │
+│  Route modules: chat · git · workspace · agent · auth              │
+│                 lint · terminal · watcher · preview · cache        │
+└───────────────────────────┬────────────────────────────────────────┘
+                            │
+                  ┌─────────┴─────────┐
+                  ▼                   ▼
+     ┌────────────────────┐  ┌─────────────────────────────┐
+     │  EngineState       │  │  PRAR Orchestrator           │
+     │  (engine_state.py) │  │  (orchestrator.py)           │
+     │  llm · pipeline_ctx│  │  run_local_pipeline          │
+     │  agent_tools · mcp │  │  run_code_aware_pipeline     │
+     │  cache_manager     │  │  run_agent_pipeline          │
+     │  repo_manager      │  │  execute_action_loop         │
+     └────────────────────┘  │  (5–25 ReAct iterations)     │
+                             └──────────┬──────────────────┘
+                                        │
+                           ┌────────────┴────────────┐
+                     Built-in Tools             MCP Tools
+                     ──────────────             ─────────
+                     FileEditorTool             mcp__playwright__*
+                     FindByNameTool             mcp__context7__*
+                     GitTool                    mcp__sequential-thinking__*
+                     SearchTool (ripgrep)
+                     WebSearchTool (Tavily)
+                     SymbolPeekerTool
+                     BrowserTool (Playwright)
+                     TerminalTool
+                     NotifyUserTool
 ```
 
 ---
@@ -46,15 +57,28 @@ GitSurf Studio follows a **Thin Client, Smart Backend** architecture. The Svelte
 | Component | Purpose |
 |---|---|
 | `App.svelte` | Root layout, workspace init, MCP status polling, auth gate |
+| `AuthPage.svelte` | GitHub OAuth login UI |
 | `ChatPanel.svelte` | Streaming AI chat, session management, @mention file injection |
+| `ChatInput.svelte` | User message input with @mention support |
+| `ChatMessage.svelte` | Individual message rendering (markdown, code blocks) |
+| `SessionList.svelte` | Chat session history list |
 | `CodeEditor.svelte` | Monaco editor, multi-tab, diff view, inline completions, linting decorations |
+| `EditorTabBar.svelte` | File tab management |
+| `DiffOverlay.svelte` | Side-by-side diff viewer |
 | `FileTree.svelte` | Hierarchical workspace browser |
 | `GitPanel.svelte` | Stage, commit, branch management |
+| `ChangeReview.svelte` | Review AI changesets before accepting |
+| `AgentProgress.svelte` | Agent step-by-step progress display |
 | `StatusBar.svelte` | Engine status, workspace name, MCP readiness indicator |
 | `TerminalPanel.svelte` | xterm.js terminal (Ctrl+` to toggle) |
+| `PreviewPanel.svelte` | Dev server preview (iframe) |
 | `SymbolBrowser.svelte` | Class/function tree with click-to-navigate |
+| `CommandPalette.svelte` | Ctrl+K command palette |
+| `ForkButton.svelte` | GitHub fork button |
 | `lib/api.js` | All engine API calls (fetch + SSE streaming) |
 | `lib/supabase.js` | Auth state, workspace persistence, recent repos |
+| `lib/fileWatcher.js` | WebSocket file-system event listener |
+| `lib/markdown.js` | Markdown rendering utilities |
 
 **Streaming protocol** — `/chat` returns NDJSON lines:
 ```
@@ -66,20 +90,30 @@ GitSurf Studio follows a **Thin Client, Smart Backend** architecture. The Svelte
 
 ---
 
-### 2. Engine State (`engine/server.py`)
+### 2. Engine State (`engine/src/engine_state.py`)
 
-A single global `EngineState` singleton, initialized lazily on first `/init` call:
+A single global `EngineState` singleton defined in `engine/src/engine_state.py`, initialized lazily on first `/init` call. `server.py` is now a thin assembly module that imports routes and registers middleware.
 
 ```python
-state.llm            # LLMClient (fast + reasoning models)
-state.pipeline_ctx   # PipelineContext (FAISS, BM25, reranker — lazy)
-state.agent_tools    # Dict[str, tool] — built-in + MCP proxies merged
-state.git_tool       # GitTool for direct REST endpoints
-state.history        # HistoryManager (local JSON)
-state.chat_memory    # ChatMemory (Supabase-backed)
-state.mcp_manager    # MCPClientManager
-state.mcp_ready      # bool — set true when MCP servers finish connecting
+state.llm             # LLMClient (fast + reasoning models)
+state.pipeline_ctx    # PipelineContext (FAISS, BM25, reranker — lazy)
+state.agent_tools     # Dict[str, tool] — built-in + MCP proxies merged
+state.git_tool        # GitTool for direct REST endpoints
+state.history         # HistoryManager (local JSON fallback)
+state.chat_memory     # ChatMemory (Supabase-backed rolling summarization)
+state.supabase_memory # SupabaseMemory (symbol graphs, call graphs by commit SHA)
+state.mcp_manager     # MCPClientManager
+state.mcp_ready       # bool — set true when MCP servers finish connecting
 state.available_tools # AVAILABLE_TOOLS string + MCP tool descriptions
+state.repo_manager    # RepoManager (clone/sync GitHub repos)
+state.cache_manager   # CacheManager (evict old repos, clean search indexes)
+state.symbol_extractor # SymbolExtractor (AST-based, all languages)
+state.terminal_tool   # TerminalTool (allowlist-enforced shell)
+state.active_changesets # Dict[id → changeset] for rollback
+state.active_executor   # Current AgentExecutor (cancel/respond target)
+state.prompt_guard    # PromptGuard (injection detection)
+state.topic_guard     # TopicGuard (off-topic request filter)
+state.workspace_path  # Absolute path to current workspace
 ```
 
 `_ensure_initialized()` registers built-in tools synchronously, then fires `_init_mcp_background()` in a daemon thread so `/init` returns immediately (< 2s). MCP servers connect in parallel via `asyncio.gather`.
@@ -97,7 +131,7 @@ Two pipeline entry points share a common action loop:
 4. Skeleton analysis — LLM identifies 3–8 relevant files
 5. Targeted retrieval — read only those files directly
 6. Keyword search — ripgrep; fallback to FAISS + BM25 if < 3 chunks found
-7. **Action loop** (up to 8 iterations)
+7. **Action loop** — **8 iterations** for Q&A, **15 iterations** for action requests (`is_action_request=True`)
 
 #### GitHub Pipeline (8 steps)
 Extends local with symbol extraction, call graph construction, triple-hybrid search (Vector + BM25 + Ripgrep merged with RRF), and cross-encoder reranking.
@@ -109,7 +143,17 @@ Each iteration:
 3. Dispatch via `getattr(tool_instance, method)(**kwargs)`
 4. Append observation; loop or stream final answer
 
-**Max iterations raised to 8** to accommodate MCP tool workflows (e.g. Context7 requires resolve + fetch = 2 calls minimum).
+**Iteration budgets by mode:**
+| Mode | Max iterations |
+|---|---|
+| Q&A requests | 8 |
+| Action requests (`is_action_request=True`) | 15 |
+| Agent mode — short plan (≤ 2 steps) | 8 |
+| Agent mode — medium plan (≤ 5 steps) | 15 |
+| Agent mode — long plan (> 5 steps) | 25 |
+| Default / fallback | 5 |
+
+**LoopGuard** prevents repetition: exact duplicate calls (same tool + method + args) are blocked after 3 occurrences (hard stop at 4). Method-level repeats are blocked after 5 (hard stop at 7). `read_file`, `search`, and MCP auto-chain targets are exempt from method counting.
 
 ---
 
@@ -150,12 +194,18 @@ MCPToolProxy (one per discovered tool)
 
 | Tool | Key methods |
 |---|---|
-| `FileEditorTool` | `read_file`, `write_file`, `replace_in_file`, `delete_file` — signals UI via stdout |
-| `GitTool` | `get_status`, `stage_files`, `commit`, `checkout_branch`, `get_diff` — uses GitPython |
+| `FileEditorTool` | `read_file`, `write_file`, `replace_in_file`, `multi_replace_file_content`, `delete_file` — signals UI via stdout |
+| `FindByNameTool` | `find_by_name` — glob pattern file search |
+| `ListFilesTool` | `list_dir`, `list_recursive` — directory listing |
+| `GitTool` | `get_status`, `stage_files`, `commit`, `checkout_branch`, `get_diff`, `stash_changes` — uses GitPython |
 | `SearchTool` | `search`, `search_and_chunk` — ripgrep `--json` wrapper |
-| `WebSearchTool` | `search` (Tavily), `fetch_url` (BeautifulSoup) |
+| `WebSearchTool` | `search` (Tavily), `fetch_url` (BeautifulSoup), `fetch_docs` |
 | `SymbolPeekerTool` | `peek_symbol` — F12 Go-to-Definition, AST-based |
-| `LintTool` | Python (ruff via stdin), JS/TS (eslint via stdin) — content-hash cache |
+| `BrowserTool` | `verify_page`, `test_interaction`, `debug_page`, `scrape_rendered` — high-level Playwright wrapper |
+| `TerminalTool` | `run_command`, `run_test`, `run_lint` — allowlist-enforced shell execution |
+| `NotifyUserTool` | `notify_user` — pause agent execution and request human input |
+| `EditorUITool` | `open_file` — open file in IDE tab |
+| `LintTool` | Python (ruff via stdin), JS/TS/Svelte (eslint via stdin) — content-hash cache; used internally by AgentExecutor |
 
 ---
 
@@ -198,6 +248,7 @@ All prompts live in `engine/src/prompts.py`. LLM responses are always parsed as 
 | `SupabaseMemory` | Supabase | Symbol graphs + call graphs — cached by commit SHA to skip re-indexing |
 | `ChatMemory` | Supabase | Multi-session conversations with rolling LLM summarization (keeps last 6 messages verbatim) |
 | `HistoryManager` | Local JSON | In-process session history fallback (`.gitsurf_history.json`) |
+| `RedisSessionMemory` | Redis (optional) | Redis-backed session persistence for multi-instance deployments |
 
 All Supabase writes are fire-and-forget background threads — never block the pipeline.
 
@@ -205,14 +256,68 @@ All Supabase writes are fire-and-forget background threads — never block the p
 
 ## Key API Endpoints
 
+### Workspace & Health
 | Endpoint | Purpose |
 |---|---|
-| `POST /init` | Initialize workspace, start MCP background init |
-| `POST /chat` | Streaming PRAR pipeline (NDJSON/SSE) |
-| `GET /mcp/status` | MCP readiness + tool list — poll after /init |
 | `GET /health` | Engine liveness |
-| `POST /lint` | Real-time linting (ruff / eslint) |
+| `GET /mcp/status` | MCP readiness + tool list — poll after /init |
+| `POST /init` | Initialize workspace (local or GitHub), start MCP background init |
+| `GET /files` | List workspace file tree |
+| `GET /read` | Read file content |
+| `POST /write` | Write / create file |
+| `POST /rename` | Rename file or directory |
+| `POST /delete-file` | Delete file |
+| `POST /delete-dir` | Delete directory |
+| `POST /mkdir` | Create directory |
+| `POST /restore` | Restore from `.bak` backup |
+| `POST /index` | Rebuild search indexes (FAISS + BM25) |
+
+### Chat
+| Endpoint | Purpose |
+|---|---|
+| `POST /chat` | Streaming PRAR pipeline (NDJSON/SSE) |
+| `POST /autocomplete` | Token autocomplete |
 | `POST /complete` | Inline code completion |
+| `POST /chat/sessions` | Create chat session |
+| `GET /chat/sessions` | List sessions for user + repo |
+| `GET /chat/sessions/{id}/messages` | Fetch session message history |
+| `DELETE /chat/sessions/{id}` | Delete session |
+
+### Git
+| Endpoint | Purpose |
+|---|---|
+| `GET /status` | Staged/unstaged changes |
+| `POST /stage` | Stage files |
+| `POST /commit` | Commit staged changes |
+| `GET /branch` | Current branch + branch list |
+| `POST /checkout` | Checkout / create branch |
+| `POST /stash` | Stash changes |
+| `POST /discard` | Discard file changes |
+| `POST /fork` | Fork GitHub repository |
+| `GET /diff-lines` | Diff by line range |
+
+### Agent
+| Endpoint | Purpose |
+|---|---|
+| `POST /agent/rollback` | Roll back a changeset |
+| `POST /agent/accept` | Accept a changeset |
+| `POST /agent/cancel` | Cancel running agent |
+| `POST /agent/respond` | Send human response to blocked agent (NotifyUser) |
+| `GET /agent/changesets` | List active changesets |
+
+### Developer Tools
+| Endpoint | Purpose |
+|---|---|
+| `GET /symbols` | Extract symbols from file |
 | `GET /peek-symbol` | F12 Go-to-Definition |
-| `GET/POST /git/*` | Status, stage, commit, branch, diff |
-| `GET/POST /chat/sessions*` | Session CRUD + message history |
+| `POST /lint` | Real-time linting (ruff / eslint) |
+| `POST /fix-lint` | Auto-fix lint issues |
+| `GET /auth/status` | GitHub OAuth status |
+| `GET /auth/login` | Initiate OAuth flow |
+| `GET /auth/callback` | OAuth callback |
+| `WS /terminal` | Interactive xterm.js terminal |
+| `WS /watch` | File system watcher events |
+| `POST /start` | Start dev-server preview |
+| `POST /stop` | Stop dev-server preview |
+| `GET /cache/status` | Cached repo + index info |
+| `POST /cache/cleanup` | Evict old cached repositories |
