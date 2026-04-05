@@ -526,6 +526,11 @@ TOOL USAGE RULES (CRITICAL):
 - You MUST ONLY use tools listed in <available_tools> above.
 - Do NOT invent tools like "FileSystemTool", "NodeTool", "DockerTool", or other non-existent tools.
 - If you need to navigate directories, use TerminalTool with the cwd parameter, or use SearchTool.
+- To start a dev server or long-running watcher: use TerminalTool.run_background(command, label), then TerminalTool.get_background_output(label) to verify it started. Stop with TerminalTool.stop_background(label).
+- To check if a port is already occupied before starting a server: use TerminalTool.check_port(port).
+- To install packages: prefer TerminalTool.install_package(manager, package) over run_command for structured output.
+- To activate a virtualenv for Python commands: use TerminalTool.activate_venv(path) once; all subsequent run_command calls will use it.
+- To run git read-only operations (status, log, diff): TerminalTool.run_command("git status") is allowed. For write ops use GitTool.
 - Do NOT try to use methods that don't exist (e.g., "FileSystemTool.change_directory").
 
 FILE EDITING RULES (CRITICAL — follow these strictly):
@@ -738,6 +743,7 @@ PLANNING RULES:
    You MUST ONLY use tools listed in the <available_tools> section above.
    Do NOT invent tools like FileSystemTool, NodeTool, DockerTool, etc.
    For shell operations (install packages, run commands), use TerminalTool with the cwd parameter.
+   To start dev servers or watchers: use TerminalTool.run_background(). To check port availability: use TerminalTool.check_port().
    Each step must use a real tool from the list above, or `__action_loop__` for complex edits.
 
 1. STEP COUNT — match exactly to complexity (CRITICAL)

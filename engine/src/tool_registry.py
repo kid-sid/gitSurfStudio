@@ -101,14 +101,34 @@ Methods:
     Fetch content from a JavaScript-rendered page (use instead of WebSearchTool.fetch_url for SPAs).
 
 Tool: TerminalTool
-Description: Execute shell commands safely in the workspace (tests, linting, builds).
+Description: Execute shell commands safely in the workspace (tests, linting, builds, dev servers).
 Methods:
   - run_command(command, timeout_sec=30, cwd=None)
-    Run a shell command. Only safe commands are allowed (pytest, ruff, npm, node, etc.).
+    Run a shell command. Allowed: pytest, ruff, npm, node, make, git (read-only), docker (read-only), curl, etc.
   - run_test(test_path=None)
     Run project tests (auto-detects pytest or npm test).
   - run_lint(file_path=None)
     Run linter (ruff for Python, eslint for JS/TS/Svelte).
+  - run_format(file_path)
+    Run formatter (ruff format for .py, prettier for .js/.ts/.svelte/.json/.css).
+  - run_script(script_content, ext="py")
+    Write a temp script and execute it. ext: "py" (python) or "js" (node). Useful for multi-step shell flows.
+  - install_package(manager, package, dev=False)
+    Install a package via "pip" or "npm" with structured success/failure output.
+  - activate_venv(path)
+    Activate a virtual environment; all subsequent run_command calls will use it.
+  - run_background(command, label, cwd=None)
+    Start a long-running process (dev server, watcher) in the background. Reference by label.
+  - stop_background(label)
+    Terminate a background process started with run_background().
+  - list_background()
+    List all running background processes with status and recent output.
+  - get_background_output(label, lines=50)
+    Read recent stdout/stderr from a background process's ring buffer.
+  - check_port(port)
+    Check if a TCP port on localhost is in use. Returns "Port N is IN USE." or "Port N is FREE."
+  - get_history(n=10)
+    Return the last n commands executed, with exit codes and timestamps.
 """
 
 
