@@ -61,3 +61,8 @@ supabase
 .pytest_cache
 .claude/
 .playwright-mcp/
+
+# --- Local scripts & test artifacts ---
+SPELLBOOK_TEST_REPORT.md
+spellbook.sh
+app/cloned-test/
