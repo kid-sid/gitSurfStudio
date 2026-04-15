@@ -49,17 +49,19 @@
     engineOnline = await checkHealth();
 
     // Resolve current session on load
-    const { data: { session } } = await supabase.auth.getSession();
-    isAuthenticated = !!session;
-
-    // Keep auth state in sync (handles OAuth redirects, sign-outs, token refresh)
-    supabase.auth.onAuthStateChange((_event, session) => {
+    if (supabase) {
+      const { data: { session } } = await supabase.auth.getSession();
       isAuthenticated = !!session;
-      if (session) getRecentWorkspaces().then(ws => { recentWorkspaces = ws; }).catch(() => {});
-    });
 
-    if (isAuthenticated) {
-      recentWorkspaces = await getRecentWorkspaces().catch(() => []);
+      // Keep auth state in sync (handles OAuth redirects, sign-outs, token refresh)
+      supabase.auth.onAuthStateChange((_event, session) => {
+        isAuthenticated = !!session;
+        if (session) getRecentWorkspaces().then(ws => { recentWorkspaces = ws; }).catch(() => {});
+      });
+
+      if (isAuthenticated) {
+        recentWorkspaces = await getRecentWorkspaces().catch(() => []);
+      }
     }
 
     // Auto-ping engine every 10 s
@@ -102,7 +104,7 @@
   });
 
   async function handleSignOut() {
-    await supabase.auth.signOut();
+    if (supabase) await supabase.auth.signOut();
     recentWorkspaces = [];
     goHome();
   }
@@ -120,7 +122,7 @@
     initError = "";
     
     try {
-      const { data: { user: initUser } } = await supabase.auth.getUser();
+      const initUser = supabase ? (await supabase.auth.getUser()).data.user : null;
       const res = await initWorkspace(initInput.trim(), initUser?.id ?? null);
       workspacePath = res.workspace_path;
       terminalCwd = res.terminal_cwd || res.workspace_path;

@@ -10,7 +10,9 @@ if (!supabaseUrl || !supabaseAnonKey) {
   );
 }
 
-export const supabase = createClient(supabaseUrl ?? "", supabaseAnonKey ?? "");
+export const supabase = supabaseUrl && supabaseAnonKey
+  ? createClient(supabaseUrl, supabaseAnonKey)
+  : null;
 
 /**
  * Saves (or updates last_opened for) a workspace entry for the current user.
@@ -19,6 +21,7 @@ export const supabase = createClient(supabaseUrl ?? "", supabaseAnonKey ?? "");
  * @param {boolean} isGitHub
  */
 export async function saveWorkspace(path, isGitHub) {
+  if (!supabase) return;
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return;
 
@@ -35,6 +38,7 @@ export async function saveWorkspace(path, isGitHub) {
  * @returns {Promise<Array<{id, name, path, is_github, last_opened}>>}
  */
 export async function getRecentWorkspaces() {
+  if (!supabase) return [];
   const { data, error } = await supabase
     .from("workspaces")
     .select("id, name, path, is_github, last_opened")
@@ -53,5 +57,6 @@ export async function getRecentWorkspaces() {
  * @param {string} id
  */
 export async function deleteWorkspace(id) {
+  if (!supabase) return;
   await supabase.from("workspaces").delete().eq("id", id);
 }
